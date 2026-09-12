@@ -49,29 +49,40 @@ def transmit(settings, source, stop, emit):
         cfg=settings['cfg']
         sdr=connect(settings,True)
         emit('log',f'Pluto подключён. TX LO={int(sdr.tx_lo)} Гц, Fs={int(sdr.sample_rate)}')
-        tid=secrets.randbits(64)
-        emit('log',f'Передача {tid:016x}: {source.total} пакетов, {len(source.raw)} байт')
-        sent=0
         size=None
-        # END is control, repeated 3 times. Data packets are sent exactly once.
-        for index in range(source.total+3):
-            if stop.is_set():
+        cycle=0
+        while not stop.is_set():
+            cycle+=1
+            tid=secrets.randbits(64)
+            emit('log',f'Цикл {cycle}, передача {tid:016x}: {source.total} пакетов, {len(source.raw)} байт')
+            emit('progress',(0,source.total,cycle))
+            sent=end_sent=0
+            # END is control, repeated 3 times. Each cycle has a fresh transfer ID.
+            for index in range(source.total+3):
+                if stop.is_set():
+                    break
+                end=index>=source.total
+                seq=source.total if end else index
+                frame=make_frame(source.meta(tid,seq,end),b'' if end else source.payload(seq),cfg)
+                gap=np.zeros(int(cfg.sample_rate*0.012),np.complex64)
+                frame=np.r_[gap,frame,gap]
+                frame=np.pad(frame,(0,(-len(frame))%4))
+                iq=(frame*4096*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
+                size=len(iq)
+                sdr.tx(iq)
+                # push completion need not mean last DAC sample; conservatively wait a full buffer.
+                stop.wait(size/cfg.sample_rate + settings['gap_ms']/1000)
+                if end:
+                    end_sent+=1
+                else:
+                    sent+=1
+                    emit('progress',(sent,source.total,cycle))
+            complete=sent==source.total and end_sent==3
+            tail=('Отправлен END; '+('остановлено пользователем.' if stop.is_set()
+                                     else 'начинаю следующий цикл.')) if complete else 'Остановлено пользователем.'
+            emit('log',f'Цикл {cycle}: в SDR отправлено {sent}/{source.total} пакетов. '+tail)
+            if not complete:
                 break
-            end=index>=source.total
-            seq=source.total if end else index
-            frame=make_frame(source.meta(tid,seq,end),b'' if end else source.payload(seq),cfg)
-            gap=np.zeros(int(cfg.sample_rate*0.012),np.complex64)
-            frame=np.r_[gap,frame,gap]
-            frame=np.pad(frame,(0,(-len(frame))%4))
-            iq=(frame*4096*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
-            size=len(iq)
-            sdr.tx(iq)
-            # push completion need not mean last DAC sample; conservatively wait a full buffer.
-            stop.wait(size/cfg.sample_rate + settings['gap_ms']/1000)
-            if not end:
-                sent+=1
-                emit('progress',(sent,source.total))
-        emit('log',f'В SDR отправлено {sent}/{source.total} пакетов. '+('Отмена.' if stop.is_set() else 'Отправлен END.'))
     finally:
         if sdr is not None:
             try:

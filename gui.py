@@ -104,7 +104,7 @@ class App(tk.Tk):
         self.controls.append((self.text,'normal'))
         run=ttk.Frame(main)
         run.pack(fill='x')
-        self.start_btn=ttk.Button(run,text='Передать один раз' if self.tx else 'Start RX',command=self.start)
+        self.start_btn=ttk.Button(run,text='Start TX' if self.tx else 'Start RX',command=self.start)
         self.start_btn.pack(side='left')
         self.stop_btn=ttk.Button(run,text='Stop',command=self.stop,state='disabled')
         self.stop_btn.pack(side='left',padx=8)
@@ -270,7 +270,8 @@ class App(tk.Tk):
             if kind=='snapshot':self.update_snapshot(value)
             elif kind=='progress':
                 self.progress.configure(value=value[0],maximum=value[1])
-                self.status.configure(text=f'TX {value[0]}/{value[1]}')
+                cycle=value[2] if len(value)>2 else 1
+                self.status.configure(text=f'TX · цикл {cycle} · {value[0]}/{value[1]}')
             elif kind=='health' and not self.stop_event.is_set():
                 self.status.configure(text=f'RX · IQ очередь {value["queue"]} · потери {value["drops"]}')
         for _ in range(100):
