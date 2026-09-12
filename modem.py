@@ -9,7 +9,7 @@ import numpy as np
 from scipy.signal import correlate, find_peaks
 from scipy.optimize import minimize_scalar
 
-MODS = ('ASK / OOK', '2-FSK', 'BPSK', 'QPSK', '8-PSK', 'QAM-4', 'QAM-8', 'QAM-16')
+MODS = ('ASK / OOK', '2-FSK', 'BPSK', 'QPSK', '8-PSK', 'QAM-4', 'QAM-16', 'QAM-64')
 SPS = 8
 DATA_SYMBOLS = 128
 PILOT_SYMBOLS = 32

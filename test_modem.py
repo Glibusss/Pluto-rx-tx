@@ -3,6 +3,14 @@ import numpy as np
 from modem import *
 
 class ModemTests(unittest.TestCase):
+    def test_supported_qam_modes(self):
+        self.assertNotIn('QAM-8',MODS)
+        self.assertEqual([mode for mode in MODS if mode.startswith('QAM-')],
+                         ['QAM-4','QAM-16','QAM-64'])
+        points,bits_per_symbol=constellation('QAM-64')
+        self.assertEqual((len(points),bits_per_symbol),(64,6))
+        self.assertAlmostEqual(float(np.mean(abs(points)**2)),1)
+
     def test_all_modes(self):
         rng = np.random.default_rng(881)
         payload = rng.integers(0,256,PAYLOAD,dtype=np.uint8).tobytes()
