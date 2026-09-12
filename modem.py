@@ -297,12 +297,6 @@ class StreamDecoder:
         self.buffer = np.r_[self.buffer, np.asarray(iq, np.complex64)]
         result = []
         short = self.sync[:32*SPS]
-        # A half-symbol differential product removes the unknown carrier phase.
-        # Its correlation finds the packet start with one FFT and its phase gives
-        # CFO over the whole supported ±100 kHz range, avoiding a costly CFO grid.
-        lag = SPS//2
-        differential_sync = short[lag:]*short[:-lag].conj()
-        differential_energy = float(np.vdot(differential_sync,differential_sync).real)
         step = self.cfg.sample_rate / len(short) / 2
         while len(self.buffer) >= self.length:
             if stop is not None and stop.is_set():
@@ -310,16 +304,26 @@ class StreamDecoder:
             # Search only starts for which a whole frame is already present.
             positions = min(len(self.buffer)-self.length+1, 32768)
             segment = self.buffer[:positions+len(short)-1]
-            differential = segment[lag:]*segment[:-lag].conj()
-            corr = correlate(differential,differential_sync,mode='valid',method='fft')
-            energy = np.convolve(abs(differential)**2,np.ones(len(differential_sync)),'valid')
-            denom = np.maximum(energy*differential_energy,1e-15)
+            energy = np.convolve(abs(segment)**2, np.ones(len(short)), 'valid')
+            denom = np.maximum(energy*len(short), 1e-15)
             # FFT roundoff over exact silence must not win normalized correlation.
             energetic = energy > max(float(energy.max())*1e-6, 1e-15)
-            best = np.where(energetic,abs(corr)**2/denom,0)
-            freqs = np.angle(corr)*self.cfg.sample_rate/(2*np.pi*lag)
-            margin = step
-            best[np.abs(freqs)>self.cfg.cfo_range+margin] = 0
+            grid = np.arange(-math.ceil(self.cfg.cfo_range/step), math.ceil(self.cfg.cfo_range/step)+1)*step
+            if self.lock_cfo is not None:
+                grid = np.r_[self.lock_cfo, self.lock_cfo-step, self.lock_cfo+step, grid]
+            best = np.zeros(positions)
+            freqs = np.zeros(positions)
+            for freq in grid:
+                if stop is not None and stop.is_set():
+                    break
+                template = short*np.exp(2j*np.pi*freq*np.arange(len(short))/self.cfg.sample_rate)
+                corr = correlate(segment, template, mode='valid', method='fft')
+                score = np.where(energetic, abs(corr)**2/denom, 0)
+                improve = score > best
+                best[improve], freqs[improve] = score[improve], freq
+                # Once locked, good prefix detection normally avoids full CFO sweep.
+                if self.lock_cfo is not None and freq == self.lock_cfo and best.max() > 0.75:
+                    break
             peaks, _ = find_peaks(np.r_[0, best, 0], height=0.48, distance=len(short)//2)
             peaks = peaks-1
             accepted = False

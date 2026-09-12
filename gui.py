@@ -12,7 +12,8 @@ import numpy as np
 from PIL import Image, ImageTk
 from modem import Config, MODS, frame_len, PREAMBLE
 from session import Source
-from radio import transmit, receive
+from radio import (RX_QUEUE_DEFAULT, calibrate_noise, receive,
+                   rx_queue_capacity, transmit)
 
 
 class App(tk.Tk):
@@ -53,6 +54,9 @@ class App(tk.Tk):
         self.gain=tk.StringVar(value='-30' if self.tx else '20')
         self.cfo=tk.StringVar(value='40000')
         self.gap=tk.StringVar(value='20')
+        self.queue_buffers=tk.StringVar(value=str(RX_QUEUE_DEFAULT))
+        self.squelch=tk.BooleanVar(value=False)
+        self.squelch_threshold=tk.StringVar(value='')
         self.pre=tk.BooleanVar(value=True)
         self.cp=tk.BooleanVar(value=False)
         entries=[('URI Pluto',self.uri,24),('Частота центра, МГц',self.freq,13),
@@ -81,7 +85,26 @@ class App(tk.Tk):
             w=ttk.Checkbutton(options,text=label,variable=var)
             w.pack(side='left',padx=5)
             self.controls.append((w,'normal'))
+        if not self.tx:
+            ttk.Label(options,text='IQ очередь, буферов:').pack(side='left',padx=(12,4))
+            w=ttk.Entry(options,textvariable=self.queue_buffers,width=7)
+            w.pack(side='left')
+            self.controls.append((w,'normal'))
         ttk.Label(options,text='Заголовок BPSK; RGB-блок 16×16; пилоты в каждом блоке').pack(side='left',padx=12)
+        if not self.tx:
+            squelch=ttk.Frame(rf)
+            squelch.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
+            w=ttk.Checkbutton(squelch,text='Отсекать шум',variable=self.squelch)
+            w.pack(side='left',padx=5)
+            self.controls.append((w,'normal'))
+            ttk.Label(squelch,text='Порог, dBFS:').pack(side='left',padx=(8,4))
+            w=ttk.Entry(squelch,textvariable=self.squelch_threshold,width=9)
+            w.pack(side='left')
+            self.controls.append((w,'normal'))
+            w=ttk.Button(squelch,text='Калибровка шума',command=self.calibrate)
+            w.pack(side='left',padx=8)
+            self.controls.append((w,'normal'))
+            ttk.Label(squelch,text='Перед калибровкой выключите TX').pack(side='left',padx=4)
         src=ttk.LabelFrame(main,text='Данные для передачи' if self.tx else 'Эталон — тот же файл или точно тот же текст, что на TX',padding=8)
         src.pack(fill='x',pady=8)
         self.kind=tk.StringVar(value='image')
@@ -192,7 +215,7 @@ class App(tk.Tk):
         self.received_text.delete('1.0','end')
         self.received_text.configure(state='disabled')
 
-    def settings(self):
+    def settings(self,include_squelch=True):
         cfg=Config(self.mod.get(),self.pre.get(),self.cp.get(),int(float(self.rate.get())*1e6),float(self.cfo.get()))
         cfg.validate()
         gain=float(self.gain.get())
@@ -202,8 +225,39 @@ class App(tk.Tk):
         if not 326e6<=freq<=3800e6:raise ValueError('Частота: 326…3800 МГц')
         gap=float(self.gap.get())
         if not 0<=gap<=2000:raise ValueError('Пауза: 0…2000 мс')
+        queue_buffers=rx_queue_capacity({'queue_buffers':self.queue_buffers.get()})
+        squelch_dbfs=None
+        if not self.tx and include_squelch and self.squelch.get():
+            if not self.squelch_threshold.get().strip():
+                raise ValueError('Сначала выполните калибровку шума или введите порог dBFS')
+            squelch_dbfs=float(self.squelch_threshold.get().replace(',','.'))
+            if not -150<=squelch_dbfs<=10:
+                raise ValueError('Шумовой порог: -150…10 dBFS')
         if not self.uri.get().strip():raise ValueError('Введите URI Pluto')
-        return dict(cfg=cfg,frequency=freq,gain=gain,gap_ms=gap,uri=self.uri.get().strip())
+        return dict(cfg=cfg,frequency=freq,gain=gain,gap_ms=gap,uri=self.uri.get().strip(),
+                    queue_buffers=queue_buffers,squelch_dbfs=squelch_dbfs)
+
+    def calibrate(self):
+        if self.tx or self.worker and self.worker.is_alive():return
+        try:
+            settings=self.settings(include_squelch=False)
+        except Exception as e:
+            messagebox.showerror('Параметры',str(e));return
+        self.stop_event.clear()
+        for widget,state in self.controls:widget.configure(state='disabled')
+        self.start_btn.configure(state='disabled')
+        self.stop_btn.configure(state='normal')
+        self.status.configure(text='Калибровка шума…')
+        self.write_log('Калибровка шума: TX должен быть выключен. Измерение около 2 секунд.')
+        def work():
+            try:
+                result=calibrate_noise(settings,self.stop_event)
+                if result is not None:self.emit('calibration',result)
+            except Exception:
+                self.emit('error',traceback.format_exc())
+            finally:self.emit('done',None)
+        self.worker=threading.Thread(target=work,name='Pluto noise calibration',daemon=True)
+        self.worker.start()
 
     def start(self):
         if self.worker and self.worker.is_alive():return
@@ -227,6 +281,8 @@ class App(tk.Tk):
         cfg=settings['cfg']
         rs=cfg.sample_rate/8
         self.write_log(f'{cfg.mod}; Rs={rs:g} симв/с; preamble={cfg.preamble}; CP={cfg.cp}.')
+        if not self.tx and settings['squelch_dbfs'] is not None:
+            self.write_log(f'Отсечение шума включено; порог {settings["squelch_dbfs"]:.1f} dBFS.')
         if self.tx:
             duration=(frame_len(cfg)+(len(PREAMBLE) if cfg.preamble else 0))/cfg.sample_rate
             self.write_log(f'Радиопакет ≈{duration*1000:.1f} мс. Одинаковая Rs и средняя энергия символа; не одинаковая Eb/N0.')
@@ -273,13 +329,23 @@ class App(tk.Tk):
                 cycle=value[2] if len(value)>2 else 1
                 self.status.configure(text=f'TX · цикл {cycle} · {value[0]}/{value[1]}')
             elif kind=='health' and not self.stop_event.is_set():
-                self.status.configure(text=f'RX · IQ очередь {value["queue"]} · потери {value["drops"]}')
+                capacity=value.get('queue_capacity','?')
+                status=f'RX · IQ очередь {value["queue"]}/{capacity} · потери {value["drops"]}'
+                if value.get('squelch_dbfs') is not None:
+                    level=value.get('input_dbfs')
+                    status+=f' · вход {"—" if level is None else f"{level:.1f}"} dBFS · отсечено {value["squelched"]}'
+                self.status.configure(text=status)
         for _ in range(100):
             try:kind,value=self.events.get_nowait()
             except queue.Empty:break
             if kind in ('log','error'):
                 self.write_log(value)
                 if kind=='error':self.tabs.select(self.log)
+            elif kind=='calibration':
+                self.squelch_threshold.set(f'{value["threshold_dbfs"]:.1f}')
+                self.squelch.set(True)
+                self.write_log(f'Калибровка завершена: шум {value["noise_dbfs"]:.1f} dBFS, '+
+                    f'порог {value["threshold_dbfs"]:.1f} dBFS, измерено буферов: {value["buffers"]}.')
             elif kind=='done':
                 for widget,state in self.controls:widget.configure(state=state)
                 self.start_btn.configure(state='normal')

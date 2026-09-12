@@ -1,4 +1,6 @@
 from __future__ import annotations
+from collections import deque
+import math
 import queue
 import secrets
 import threading
@@ -7,6 +9,57 @@ from pathlib import Path
 import numpy as np
 from modem import Config, make_frame, StreamDecoder
 from session import Reception
+
+
+RX_QUEUE_MIN = 16
+RX_QUEUE_DEFAULT = 512
+RX_QUEUE_MAX = 8192
+ADC_FULL_SCALE = 2048.0
+
+
+def rx_queue_capacity(settings):
+    try:
+        value=int(settings.get('queue_buffers',RX_QUEUE_DEFAULT))
+    except (TypeError,ValueError) as error:
+        raise ValueError(f'Размер IQ-очереди: {RX_QUEUE_MIN}…{RX_QUEUE_MAX} буферов') from error
+    if not RX_QUEUE_MIN<=value<=RX_QUEUE_MAX:
+        raise ValueError(f'Размер IQ-очереди: {RX_QUEUE_MIN}…{RX_QUEUE_MAX} буферов')
+    return value
+
+
+def power_dbfs(iq):
+    samples=np.asarray(iq)
+    if not samples.size:
+        raise ValueError('Пустой IQ-буфер')
+    power=float(np.mean(abs(samples)**2))
+    return 10*math.log10(max(power/(ADC_FULL_SCALE**2),1e-20))
+
+
+def noise_threshold(buffer_dbfs):
+    values=np.asarray(buffer_dbfs,float)
+    if not values.size or not np.all(np.isfinite(values)):
+        raise ValueError('Нет корректных измерений шума')
+    noise=float(np.median(values))
+    high=float(np.quantile(values,.99))
+    threshold=max(noise+3,high+1)
+    return dict(noise_dbfs=noise,threshold_dbfs=threshold,
+                spread_db=float(np.std(values)),buffers=len(values))
+
+
+def calibrate_noise(settings, stop, duration=2.0):
+    sdr=None
+    try:
+        sdr=connect(settings,False)
+        count=max(8,math.ceil(duration*int(sdr.sample_rate)/int(sdr.rx_buffer_size)))
+        levels=[]
+        for _ in range(count):
+            if stop.is_set():
+                return None
+            levels.append(power_dbfs(sdr.rx()))
+        return noise_threshold(levels)
+    finally:
+        if sdr is not None:
+            sdr.rx_destroy_buffer()
 
 
 def connect(settings, tx=False):
@@ -98,18 +151,36 @@ def transmit(settings, source, stop, emit):
 def receive(settings, reference, folder, stop, emit):
     sdr=None
     capture=None
-    frames=queue.Queue(maxsize=96)
+    frames=queue.Queue(maxsize=rx_queue_capacity(settings))
     errors=queue.Queue()
     capture_stop=threading.Event()
     dropped=[0]
+    squelched=[0]
+    input_dbfs=[None]
     session=None
     decoder=StreamDecoder(settings['cfg'])
+    threshold_dbfs=settings.get('squelch_dbfs')
+    threshold_power=(None if threshold_dbfs is None else
+                     ADC_FULL_SCALE**2*10**(float(threshold_dbfs)/10))
     try:
         sdr=connect(settings,False)
         emit('log',f'Pluto подключён. RX LO={int(sdr.rx_lo)} Гц. Приём до Stop.')
+        if threshold_dbfs is not None:
+            emit('log',f'Шумовой порог включён: {float(threshold_dbfs):.1f} dBFS.')
         def collect():
             offset=0
             gap=False
+            tail=0
+            pretrigger=deque(maxlen=2)
+            def enqueue(item):
+                nonlocal gap
+                iq,clipping=item
+                try:
+                    frames.put_nowait((iq,gap,clipping))
+                    gap=False
+                except queue.Full:
+                    dropped[0]+=1
+                    gap=True
             try:
                 while not capture_stop.is_set():
                     raw=np.asarray(sdr.rx(),np.complex64)
@@ -118,12 +189,24 @@ def receive(settings, reference, folder, stop, emit):
                     iq=raw*mixer
                     offset=(offset+len(raw))%4
                     clipping=float(np.mean((abs(raw.real)>=32760)|(abs(raw.imag)>=32760)))
-                    try:
-                        frames.put_nowait((iq,gap,clipping))
-                        gap=False
-                    except queue.Full:
-                        dropped[0]+=1
-                        gap=True
+                    raw_power=float(np.mean(abs(raw)**2))
+                    input_dbfs[0]=10*math.log10(max(raw_power/(ADC_FULL_SCALE**2),1e-20))
+                    if threshold_power is None:
+                        enqueue((iq,clipping))
+                    elif raw_power>=threshold_power:
+                        while pretrigger:
+                            enqueue(pretrigger.popleft())
+                        enqueue((iq,clipping))
+                        tail=2
+                    elif tail:
+                        enqueue((iq,clipping))
+                        tail-=1
+                    else:
+                        if len(pretrigger)==pretrigger.maxlen:
+                            pretrigger.popleft()
+                            squelched[0]+=1
+                            gap=True
+                        pretrigger.append((iq,clipping))
             except Exception as e:
                 if not capture_stop.is_set():
                     errors.put(e)
@@ -138,6 +221,12 @@ def receive(settings, reference, folder, stop, emit):
             try:
                 iq,gap,clipping=frames.get(timeout=.15)
             except queue.Empty:
+                now=time.monotonic()
+                if now-last>.5:
+                    emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
+                        queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
+                        squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs))
+                    last=now
                 continue
             if gap:
                 decoder.reset()
@@ -175,7 +264,8 @@ def receive(settings, reference, folder, stop, emit):
                     session.transport_drops=dropped[0]
                     emit('snapshot',session.snapshot())
                 emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
-                                   queue=frames.qsize(),drops=dropped[0]))
+                    queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
+                    squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs))
                 last=now
     finally:
         capture_stop.set()

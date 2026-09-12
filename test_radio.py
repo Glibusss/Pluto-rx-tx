@@ -35,6 +35,28 @@ class StopAfterWaits:
     def wait(self,duration):self.waits+=1;return self.is_set()
 
 class RadioTests(unittest.TestCase):
+    def test_noise_power_and_automatic_threshold(self):
+        self.assertAlmostEqual(radio.power_dbfs(np.full(32,radio.ADC_FULL_SCALE)),0)
+        result=radio.noise_threshold([-81,-80,-80,-79.5,-80.5])
+        self.assertAlmostEqual(result['noise_dbfs'],-80)
+        self.assertGreaterEqual(result['threshold_dbfs'],result['noise_dbfs']+3)
+
+    def test_noise_calibration_reads_pluto_and_cleans_up(self):
+        sdr=FakeRX()
+        sdr.sample_rate=1_000_000
+        sdr.rx_buffer_size=32768
+        with patch.object(radio,'connect',return_value=sdr):
+            result=radio.calibrate_noise(dict(cfg=Config()),threading.Event(),duration=.01)
+        self.assertEqual(result['buffers'],8)
+        self.assertTrue(sdr.destroyed)
+
+    def test_rx_queue_capacity_is_configurable_and_bounded(self):
+        self.assertEqual(radio.rx_queue_capacity({}),512)
+        self.assertEqual(radio.rx_queue_capacity({'queue_buffers':'8192'}),8192)
+        for value in (15,8193,'bad'):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                radio.rx_queue_capacity({'queue_buffers':value})
+
     def test_tx_repeats_with_new_transfer_id_until_stop(self):
         sdr=FakeTX();source=Source.text('Hello Pluto')
         settings=dict(cfg=Config(),gap_ms=0)
