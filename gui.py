@@ -1,6 +1,7 @@
 from __future__ import annotations
 import codecs
 import json
+import math
 import queue
 import threading
 import time
@@ -14,6 +15,19 @@ from modem import Config, MODS, frame_len, PREAMBLE
 from session import Source
 from radio import (RX_QUEUE_DEFAULT, calibrate_noise, receive,
                    rx_queue_capacity, transmit)
+
+
+def gain_power_text(value):
+    """Describe an AD936x gain value as an ideal linear power ratio."""
+    try:
+        db=float(str(value).strip().replace(',','.'))
+        if not math.isfinite(db):
+            raise ValueError
+        ratio=10**(db/10)
+    except (TypeError,ValueError,OverflowError):
+        return 'линейно по мощности: —'
+    number=f'{ratio:.4g}'.replace('.',',')
+    return f'линейно по мощности: ×{number}'
 
 
 class App(tk.Tk):
@@ -52,6 +66,7 @@ class App(tk.Tk):
         self.mod=tk.StringVar(value='BPSK')
         self.rate=tk.StringVar(value='1')
         self.gain=tk.StringVar(value='-30' if self.tx else '20')
+        self.gain_info=tk.StringVar(value=gain_power_text(self.gain.get()))
         self.cfo=tk.StringVar(value='40000')
         self.gap=tk.StringVar(value='20')
         self.queue_buffers=tk.StringVar(value=str(RX_QUEUE_DEFAULT))
@@ -60,12 +75,21 @@ class App(tk.Tk):
         self.pre=tk.BooleanVar(value=True)
         self.cp=tk.BooleanVar(value=False)
         entries=[('URI Pluto',self.uri,24),('Частота центра, МГц',self.freq,13),
-                 ('TX gain, dB (≤0)' if self.tx else 'RX gain, dB',self.gain,12)]
+                 ('TX gain Pluto, dB (≤0)' if self.tx else 'RX gain Pluto, dB',self.gain,12)]
         for col,(label,var,width) in enumerate(entries):
             ttk.Label(rf,text=label).grid(row=0,column=col*2,sticky='w',padx=4)
-            w=ttk.Entry(rf,textvariable=var,width=width)
-            w.grid(row=0,column=col*2+1,padx=4,sticky='ew')
+            parent=rf
+            if var is self.gain:
+                parent=ttk.Frame(rf)
+                parent.grid(row=0,column=col*2+1,padx=4,sticky='ew')
+            w=ttk.Entry(parent,textvariable=var,width=width)
+            if var is self.gain:
+                w.pack(side='left')
+                ttk.Label(parent,textvariable=self.gain_info).pack(side='left',padx=(7,0))
+            else:
+                w.grid(row=0,column=col*2+1,padx=4,sticky='ew')
             self.controls.append((w,'normal'))
+        self.gain.trace_add('write',self.update_gain_info)
         ttk.Label(rf,text='Модуляция').grid(row=1,column=0,sticky='w',padx=4,pady=8)
         w=ttk.Combobox(rf,textvariable=self.mod,values=MODS,state='readonly',width=20)
         w.grid(row=1,column=1,sticky='ew',padx=4)
@@ -195,6 +219,9 @@ class App(tk.Tk):
                 f'{self.source.total} пакетов, SHA {self.source.digest.hex()[:8]}'))
             self.show_image(self.left,Image.fromarray(self.source.rgb),'left')
         except Exception as e:messagebox.showerror('Изображение',str(e))
+
+    def update_gain_info(self,*_):
+        self.gain_info.set(gain_power_text(self.gain.get()))
 
     def load_text(self):
         path=filedialog.askopenfilename(filetypes=[('Текст','*.txt'),('Все файлы','*.*')])
