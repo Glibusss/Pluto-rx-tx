@@ -60,9 +60,20 @@ class Reception:
     def __init__(self, meta, reference, mod):
         self.meta, self.mod = meta, mod
         self.reference = reference
-        self.reference_ok = bool(reference and reference.digest == meta.digest and
-            reference.kind == meta.kind and reference.width == meta.width and
-            reference.height == meta.height and len(reference.raw) == meta.size)
+        if reference is None:
+            self.reference_status='эталон не выбран'
+        elif reference.kind != meta.kind:
+            self.reference_status='тип эталона не совпадает (текст/RGB)'
+        elif len(reference.raw) != meta.size:
+            self.reference_status=f'размер эталона не совпадает ({len(reference.raw)} вместо {meta.size} байт)'
+        elif reference.width != meta.width or reference.height != meta.height:
+            self.reference_status=(f'размеры изображения не совпадают '
+                                   f'({reference.width}×{reference.height} вместо {meta.width}×{meta.height})')
+        elif reference.digest != meta.digest:
+            self.reference_status='содержимое эталона не совпадает (другой SHA-256)'
+        else:
+            self.reference_status='эталон совпадает'
+        self.reference_ok=self.reference_status=='эталон совпадает'
         self.data = bytearray([128]*meta.size) if meta.kind else bytearray(meta.size)
         self.rows = {}
         self.ended = False
@@ -138,7 +149,7 @@ class Reception:
             per=(self.meta.total-good)/self.meta.total,per_final=bool(final or self.ended),
             ber=errors/compared if compared else None,bit_errors=errors,compared_bits=compared,
             expected_bits=expected_bits,ber_coverage=compared/expected_bits,
-            reference_match=self.reference_ok,snr_estimate_db=snr,
+            reference_match=self.reference_ok,reference_status=self.reference_status,snr_estimate_db=snr,
             snr_method='reference error at symbol decisions; includes residual channel distortion',
             end_seen=self.ended,duplicates=self.duplicates,last_cfo_hz=self.cfo,
             transport_dropped_buffers=self.transport_drops)

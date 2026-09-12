@@ -248,8 +248,9 @@ def receive(settings, reference, folder, stop, emit):
                     if session is not None:
                         emit('log','Предыдущий результат: '+session.save(folder,True))
                     session=Reception(packet.meta,reference,settings['cfg'].mod)
-                    emit('log',f'Передача {packet.meta.transfer:016x}; пакетов: {packet.meta.total}; эталон: '+
-                         ('совпадает' if session.reference_ok else 'не выбран / не совпадает — BER и SNR недоступны'))
+                    suffix='' if session.reference_ok else ' — BER и SNR недоступны'
+                    emit('log',f'Передача {packet.meta.transfer:016x}; пакетов: {packet.meta.total}; '+
+                         session.reference_status+suffix)
                 was_end=session.ended
                 session.accept(packet)
                 session.transport_drops=dropped[0]

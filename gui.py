@@ -117,13 +117,15 @@ class App(tk.Tk):
         w=ttk.Button(top,text='Выбрать изображение',command=self.load_image)
         w.pack(side='left',padx=8)
         self.controls.append((w,'normal'))
-        w=ttk.Button(top,text='Загрузить TXT (UTF-8)',command=self.load_text)
+        w=ttk.Button(top,text='Загрузить TXT (необязательно)',command=self.load_text)
         w.pack(side='left',padx=4)
         self.controls.append((w,'normal'))
         self.source_label=ttk.Label(top,text='Файл не выбран')
         self.source_label.pack(side='left',padx=8)
+        ttk.Label(src,text='Или введите текст прямо в поле:').pack(anchor='w',pady=(8,0))
         self.text=tk.Text(src,height=3,wrap='word',font=('Consolas',10))
-        self.text.pack(fill='x',pady=(8,0))
+        self.text.pack(fill='x',pady=(3,0))
+        self.text.bind('<FocusIn>',self.select_text_input)
         self.controls.append((self.text,'normal'))
         run=ttk.Frame(main)
         run.pack(fill='x')
@@ -175,7 +177,8 @@ class App(tk.Tk):
         try:
             self.source=Source.image(path)
             self.kind.set('image')
-            self.source_label.configure(text=f'{self.source.width}×{self.source.height}, {self.source.total} пакетов')
+            self.source_label.configure(text=(f'{self.source.label}: {self.source.width}×{self.source.height}, '
+                f'{self.source.total} пакетов, SHA {self.source.digest.hex()[:8]}'))
             self.show_image(self.left,Image.fromarray(self.source.rgb),'left')
         except Exception as e:messagebox.showerror('Изображение',str(e))
 
@@ -187,7 +190,12 @@ class App(tk.Tk):
             self.text.delete('1.0','end')
             self.text.insert('1.0',value)
             self.kind.set('text')
+            self.source_label.configure(text=f'{Path(path).name}: текст загружен')
         except Exception as e:messagebox.showerror('Текст',str(e))
+
+    def select_text_input(self,event=None):
+        self.kind.set('text')
+        self.source_label.configure(text='Текст из поля — файл не требуется')
 
     def pick_folder(self):
         path=filedialog.askdirectory()
@@ -363,7 +371,8 @@ class App(tk.Tk):
             f'     SNR-оценка: {number(s["snr_estimate_db"])} dB\n'
             f'GOOD: {s["good_packets"]}   CRC: {s["crc_packets"]}   '
             f'{"LOST" if s["per_final"] else "Ожидаются / потеряны"}: {s["missing_packets"]}   '
-            f'Всего: {s["expected_packets"]}   CFO: {s["last_cfo_hz"]:.0f} Гц'))
+            f'Всего: {s["expected_packets"]}   CFO: {s["last_cfo_hz"]:.0f} Гц'+
+            ('' if s['reference_match'] else f'\nBER недоступен: {s["reference_status"]}')))
         self.progress.configure(maximum=s['expected_packets'],value=s['received_packets'])
         if s['kind']=='RGB':
             self.show_image(self.right,Image.frombytes('RGB',(s['width'],s['height']),snapshot['data']),'right')

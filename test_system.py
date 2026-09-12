@@ -92,6 +92,16 @@ class IntegrationTests(unittest.TestCase):
         other=Reception(src.meta(31,0),wrong,'BPSK')
         self.assertIsNone(other.stats()['ber'])
         self.assertIsNone(other.stats()['snr_estimate_db'])
+        self.assertEqual(other.stats()['reference_status'],'тип эталона не совпадает (текст/RGB)')
+
+    def test_reference_status_explains_image_mismatch(self):
+        first=Source(1,bytes([0])*3*16*16,16,16)
+        changed=Source(1,bytes([1])*3*16*16,16,16)
+        reception=Reception(first.meta(8,0),changed,'BPSK')
+        self.assertFalse(reception.reference_ok)
+        self.assertIn('SHA-256',reception.stats()['reference_status'])
+        no_reference=Reception(first.meta(9,0),None,'BPSK')
+        self.assertEqual(no_reference.stats()['reference_status'],'эталон не выбран')
 
     def test_noise_does_not_create_packets(self):
         rng=np.random.default_rng(992)
