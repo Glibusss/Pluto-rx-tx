@@ -1,9 +1,11 @@
 import threading
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import radio
-from modem import Config, StreamDecoder
+from modem import Config, StreamDecoder, PREAMBLE, decode_frame, make_frame
 from session import Source
 
 class FakeTX:
@@ -15,6 +17,13 @@ class FakeTX:
         self.tx_hardwaregain_chan0=-30
     def tx(self,iq):self.calls.append(iq.copy())
     def tx_destroy_buffer(self):self.destroyed=True
+
+class FakeRX:
+    def __init__(self):
+        self.rx_lo=2399750000
+        self.destroyed=False
+    def rx(self):return np.zeros(64,np.complex64)
+    def rx_destroy_buffer(self):self.destroyed=True
 
 class NoWait:
     def is_set(self):return False
@@ -47,6 +56,26 @@ class RadioTests(unittest.TestCase):
         self.assertNotEqual(data_packets[0].meta.transfer,data_packets[1].meta.transfer)
         self.assertEqual(sum(p.meta.end for p in packets),6)
         self.assertIn(('progress',(0,source.total,2)),events)
+
+    def test_rx_waits_for_packet_zero_and_stops_on_end(self):
+        cfg=Config()
+        source=Source.text('Hello RX')
+        tid=72
+        skipped=decode_frame(make_frame(source.meta(tid,source.total,True),b'',cfg)[len(PREAMBLE):],cfg,0)
+        data=decode_frame(make_frame(source.meta(tid+1,0),source.payload(0),cfg)[len(PREAMBLE):],cfg,0)
+        end=decode_frame(make_frame(source.meta(tid+1,source.total,True),b'',cfg)[len(PREAMBLE):],cfg,0)
+        decoder=unittest.mock.Mock()
+        decoder.candidates=decoder.header_failures=0
+        decoder.feed.side_effect=[[skipped,data,end]]
+        stop=threading.Event();events=[];sdr=FakeRX()
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(radio,'connect',return_value=sdr),patch.object(radio,'StreamDecoder',return_value=decoder):
+                radio.receive(dict(cfg=cfg),None,folder,stop,lambda *x:events.append(x))
+            saved=list(Path(folder).glob('transfer_*'))
+        self.assertTrue(stop.is_set())
+        self.assertTrue(sdr.destroyed)
+        self.assertEqual(len(saved),1)
+        self.assertTrue(any(kind=='log' and 'RX останавливается' in value for kind,value in events))
 
     def test_tx_cleanup_on_failure(self):
         sdr=FakeTX()

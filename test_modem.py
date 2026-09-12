@@ -34,5 +34,23 @@ class ModemTests(unittest.TestCase):
                 self.assertEqual(packets[0].payload,data)
                 self.assertTrue(packets[0].crc_ok)
 
+    def test_stream_near_cfo_search_edges(self):
+        rng=np.random.default_rng(71)
+        data=rng.integers(0,256,PAYLOAD,dtype=np.uint8).tobytes()
+        for rate in (1_000_000,2_000_000):
+            for cfo in (-39_000,39_000):
+                cfg=Config('BPSK',True,False,rate,40_000)
+                m=Meta(1,83,0,1,PAYLOAD,16,16,PAYLOAD,b'z'*16)
+                wave=np.r_[np.zeros(211),make_frame(m,data,cfg),np.zeros(900)]
+                wave=.8*wave*np.exp(1j*(.4+2*np.pi*cfo*np.arange(len(wave))/rate))
+                wave+=.008*(rng.normal(size=len(wave))+1j*rng.normal(size=len(wave)))
+                decoder=StreamDecoder(cfg)
+                packets=[]
+                for chunk in np.array_split(wave,13):packets+=decoder.feed(chunk)
+                with self.subTest(rate=rate,cfo=cfo):
+                    self.assertEqual(len(packets),1)
+                    self.assertEqual(packets[0].payload,data)
+                    self.assertTrue(packets[0].crc_ok)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -131,6 +131,7 @@ def receive(settings, reference, folder, stop, emit):
         capture.start()
         last=0
         last_clip=0
+        last_gap_log=0
         while not stop.is_set():
             if not errors.empty():
                 raise RuntimeError(f'Ошибка чтения SDR: {errors.get()}')
@@ -140,12 +141,20 @@ def receive(settings, reference, folder, stop, emit):
                 continue
             if gap:
                 decoder.reset()
-                emit('log',f'Перегрузка обработки: потеряно IQ-буферов {dropped[0]}. Поиск пакета заново.')
+                now=time.monotonic()
+                if now-last_gap_log>=1:
+                    emit('log',f'Перегрузка обработки: потеряно IQ-буферов {dropped[0]}. Поиск пакета заново.')
+                    last_gap_log=now
             if clipping>.001 and time.monotonic()-last_clip>3:
                 last_clip=time.monotonic()
                 emit('log','Обнаружено ограничение I/Q. Уменьшите RX gain / уровень TX.')
             packets=decoder.feed(iq,stop)
             for packet in packets:
+                # Continuous TX repeats transfers. Start only at packet zero so an
+                # RX launched in the middle of a cycle waits for one complete result.
+                if ((session is None or session.meta.transfer != packet.meta.transfer) and
+                        (packet.meta.end or packet.meta.seq != 0)):
+                    continue
                 if session is None or session.meta.transfer != packet.meta.transfer:
                     if session is not None:
                         emit('log','Предыдущий результат: '+session.save(folder,True))
@@ -157,8 +166,9 @@ def receive(settings, reference, folder, stop, emit):
                 session.transport_drops=dropped[0]
                 emit('snapshot',session.snapshot())
                 if session.ended and not was_end:
-                    emit('log','Получен END. Приём остаётся включённым.')
-                    emit('log','Результат: '+session.save(folder,True))
+                    emit('log','Получен END. Передача принята; RX останавливается.')
+                    stop.set()
+                    break
             now=time.monotonic()
             if now-last>.5:
                 if session:
