@@ -10,10 +10,14 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
@@ -36,6 +40,115 @@ TUNING_MODES = ('fixed', 'sweep')
 OPERATION_MODES = ('continuous', 'pulse')
 MAX_CYCLE_BYTES = 8 * 1024 * 1024
 PACKET_RATE = 2_000_000
+
+
+def _tool_filename(name: str) -> str:
+    return name + '.exe' if os.name == 'nt' and not name.lower().endswith('.exe') else name
+
+
+def _common_tool_directories(preferred: str = '') -> list[Path]:
+    """Return bounded, conventional HackRF Tools locations without scanning a drive."""
+    directories: list[Path] = []
+    if preferred:
+        preferred_path = Path(preferred.strip().strip('"')).expanduser()
+        if preferred_path.parent != Path('.'):
+            directories.append(preferred_path.parent)
+    directories += [Path(__file__).resolve().parent, Path(sys.executable).resolve().parent]
+
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    if conda_prefix:
+        directories += [Path(conda_prefix) / 'Library' / 'bin', Path(conda_prefix) / 'bin']
+    mamba_root = os.environ.get('MAMBA_ROOT_PREFIX')
+    if mamba_root:
+        directories += [Path(mamba_root) / 'Library' / 'bin', Path(mamba_root) / 'bin']
+    user_profile = os.environ.get('USERPROFILE')
+    if user_profile:
+        directories.append(Path(user_profile) / 'scoop' / 'apps' / 'hackrf' / 'current' / 'bin')
+
+    roots = [os.environ.get('ProgramFiles'), os.environ.get('ProgramFiles(x86)'),
+             os.environ.get('LOCALAPPDATA')]
+    for value in filter(None, roots):
+        root = Path(value)
+        directories += [root / 'HackRF' / 'bin', root / 'HackRF Tools' / 'bin',
+                        root / 'Great Scott Gadgets' / 'HackRF' / 'bin',
+                        root / 'PothosSDR' / 'bin', root / 'Programs' / 'HackRF' / 'bin']
+        try:
+            directories.extend(path / 'bin' for path in root.glob('PothosSDR*'))
+        except OSError:
+            pass
+
+    unique: list[Path] = []
+    seen = set()
+    for directory in directories:
+        key = os.path.normcase(os.path.abspath(str(directory)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(directory)
+    return unique
+
+
+def find_hackrf_tool(name: str, preferred: str = '') -> str | None:
+    """Locate one HackRF command in an explicit path, PATH, or common installs."""
+    filename = _tool_filename(name)
+    if preferred:
+        explicit = Path(preferred.strip().strip('"')).expanduser()
+        if explicit.is_file():
+            return str(explicit.resolve())
+        resolved = shutil.which(preferred.strip().strip('"'))
+        if resolved:
+            return str(Path(resolved).resolve())
+    resolved = shutil.which(name) or shutil.which(filename)
+    if resolved:
+        return str(Path(resolved).resolve())
+    for directory in _common_tool_directories(preferred):
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate.resolve())
+        if os.name != 'nt':
+            candidate = directory / name
+            if candidate.is_file():
+                return str(candidate.resolve())
+    return None
+
+
+def find_hackrf_transfer(preferred: str = '') -> str | None:
+    return find_hackrf_tool('hackrf_transfer', preferred)
+
+
+def find_hackrf_info(transfer_path: str = '') -> str | None:
+    preferred = ''
+    if transfer_path:
+        path = Path(transfer_path.strip().strip('"')).expanduser()
+        preferred = str(path.with_name(_tool_filename('hackrf_info')))
+    return find_hackrf_tool('hackrf_info', preferred)
+
+
+def parse_hackrf_info(output: str) -> list[str]:
+    """Extract unique device serial numbers from standard hackrf_info output."""
+    serials = re.findall(r'^\s*Serial number:\s*(\S+)\s*$', output,
+                         flags=re.IGNORECASE | re.MULTILINE)
+    return list(dict.fromkeys(serials))
+
+
+def discover_hackrf_devices(transfer_path: str = '', runner=subprocess.run) -> tuple[str, list[str], str]:
+    """Run hackrf_info and return its path, detected serials, and diagnostic output."""
+    info_path = find_hackrf_info(transfer_path)
+    if not info_path:
+        raise FileNotFoundError(
+            'hackrf_info не найден рядом с hackrf_transfer или в каталогах HackRF Tools.')
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                  errors='replace', timeout=10)
+    if os.name == 'nt':
+        kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    result = runner([info_path], **kwargs)
+    output = result.stdout or ''
+    serials = parse_hackrf_info(output)
+    no_boards = 'No HackRF boards found.' in output
+    if result.returncode and not serials and not no_boards:
+        details = '\n'.join(output.strip().splitlines()[-4:])
+        raise RuntimeError('hackrf_info завершился с кодом '
+                           f'{result.returncode}' + (f':\n{details}' if details else ''))
+    return info_path, serials, output
 
 
 @dataclass(frozen=True)
@@ -266,16 +379,62 @@ def build_command(cfg: EmitterConfig, iq_path: str | Path,
 
 
 def resolve_executable(value: str) -> str:
-    value = value.strip().strip('"')
-    path = Path(value)
-    if path.is_absolute() or path.parent != Path('.'):
-        if path.is_file():
-            return str(path)
-    resolved = shutil.which(value)
+    resolved = find_hackrf_transfer(value)
     if resolved:
         return resolved
     raise FileNotFoundError(
         'hackrf_transfer не найден. Установите HackRF Tools или укажите полный путь к exe.')
+
+
+def stop_hackrf_process(process, windows: bool | None = None) -> str:
+    """Stop hackrf_transfer gracefully when possible, then fall back to termination."""
+    if process.poll() is not None:
+        return 'already-stopped'
+    windows = os.name == 'nt' if windows is None else windows
+    if windows and hasattr(signal, 'CTRL_BREAK_EVENT'):
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            process.wait(timeout=5)
+            return 'ctrl-break'
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    if process.poll() is not None:
+        return 'ctrl-break-late'
+    try:
+        process.terminate()
+        process.wait(timeout=3)
+        return 'terminate'
+    except OSError:
+        if process.poll() is not None:
+            return 'terminate-race'
+        raise
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=3)
+            return 'kill'
+        except (OSError, subprocess.TimeoutExpired):
+            return 'still-running'
+
+
+def cleanup_temp_directory(folder: str | Path, emit=lambda *_: None,
+                           remover=shutil.rmtree, sleeper=time.sleep) -> bool:
+    """Retry Windows cleanup because hackrf_transfer can release its file handle late."""
+    folder = Path(folder)
+    last_error = None
+    for delay in (0, 0.05, 0.15, 0.35, 0.75, 1.5):
+        if delay:
+            sleeper(delay)
+        try:
+            remover(folder)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as error:
+            last_error = error
+    emit('log', f'Временный IQ пока занят и оставлен для последующей очистки: '
+                f'{folder} ({last_error})')
+    return False
 
 
 def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
@@ -283,8 +442,11 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
     cfg.validate()
     executable = resolve_executable(cfg.executable)
     process = None
-    with tempfile.TemporaryDirectory(prefix='tx_emitter_') as folder:
-        iq_path = Path(folder) / 'waveform.cs8'
+    reader = None
+    stop_attempted = False
+    folder = Path(tempfile.mkdtemp(prefix='tx_emitter_'))
+    try:
+        iq_path = folder / 'waveform.cs8'
         emit('status', 'Формирование IQ…')
         iq = build_cycle(cfg)
         iq_path.write_bytes(complex_to_cs8(iq))
@@ -296,41 +458,42 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
         kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                       text=True, errors='replace', bufsize=1)
         if os.name == 'nt':
-            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        try:
-            process = subprocess.Popen(command, **kwargs)
+            # hackrf_transfer handles CTRL_BREAK and shuts libhackrf/file handles
+            # down cleanly. A separate process group lets us target only it.
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+        process = subprocess.Popen(command, **kwargs)
 
-            def read_output():
-                assert process is not None
-                if process.stdout is not None:
-                    for line in process.stdout:
-                        line = line.strip()
-                        if line:
-                            emit('log', line)
+        def read_output():
+            assert process is not None
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        emit('log', line)
 
-            reader = threading.Thread(target=read_output, name='hackrf_transfer output',
-                                      daemon=True)
-            reader.start()
-            emit('status', 'TX активен')
-            emit('log', 'Передача запущена. Stop завершит hackrf_transfer.')
-            while process.poll() is None and not stop.wait(0.1):
-                pass
-            if stop.is_set() and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-            reader.join(timeout=1)
-            code = process.returncode
-            if not stop.is_set() and code:
-                raise RuntimeError(f'hackrf_transfer завершился с кодом {code}')
-        finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            emit('status', 'Остановлено')
+        reader = threading.Thread(target=read_output, name='hackrf_transfer output',
+                                  daemon=True)
+        reader.start()
+        emit('status', 'TX активен')
+        emit('log', 'Передача запущена. Stop завершит hackrf_transfer.')
+        while process.poll() is None and not stop.wait(0.1):
+            pass
+        if stop.is_set() and process.poll() is None:
+            method = stop_hackrf_process(process)
+            stop_attempted = True
+            emit('log', f'hackrf_transfer остановлен ({method}).')
+            if method == 'still-running':
+                raise RuntimeError(
+                    'hackrf_transfer не завершился после Stop. Отключите и снова '
+                    'подключите HackRF; при необходимости перезагрузите Windows.')
+        reader.join(timeout=2)
+        code = process.returncode
+        if not stop.is_set() and code:
+            raise RuntimeError(f'hackrf_transfer завершился с кодом {code}')
+    finally:
+        if process is not None and process.poll() is None and not stop_attempted:
+            stop_hackrf_process(process)
+        if reader is not None and reader.is_alive():
+            reader.join(timeout=2)
+        cleanup_temp_directory(folder, emit)
+        emit('status', 'Остановлено')

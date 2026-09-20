@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from hackrf_emitter import (EmitterConfig, HACKRF_SAMPLE_RATES, MODS,
+                            discover_hackrf_devices, find_hackrf_transfer,
                             run_transmitter)
 
 
@@ -21,11 +22,13 @@ class EmitterApp(tk.Tk):
         self.events = queue.SimpleQueue()
         self.stop_event = threading.Event()
         self.worker = None
+        self.discovery_worker = None
         self.controls = []
         self.closing = False
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.build()
         self.after(100, self.poll)
+        self.after(250, lambda: self.start_discovery(include_devices=True, silent=True))
 
     def _entry(self, parent, label, variable, row, column, width=12):
         ttk.Label(parent, text=label).grid(row=row, column=column * 2, sticky='w',
@@ -41,7 +44,7 @@ class EmitterApp(tk.Tk):
 
         device = ttk.LabelFrame(main, text='HackRF и RF-параметры', padding=8)
         device.pack(fill='x')
-        for column in range(6):
+        for column in range(7):
             device.columnconfigure(column, weight=1 if column % 2 else 0)
         self.executable = tk.StringVar(value='hackrf_transfer')
         self.serial = tk.StringVar()
@@ -51,10 +54,25 @@ class EmitterApp(tk.Tk):
         self.gain = tk.StringVar(value='0')
         self.amplitude = tk.StringVar(value='35')
         self.rf_amp = tk.BooleanVar(value=False)
-        self._entry(device, 'hackrf_transfer', self.executable, 0, 0, 26)
-        ttk.Button(device, text='Обзор…', command=self.pick_executable).grid(
-            row=0, column=2, sticky='w', padx=5)
-        self._entry(device, 'Serial (необязательно)', self.serial, 0, 2, 23)
+        ttk.Label(device, text='hackrf_transfer').grid(row=0, column=0, sticky='w', padx=5)
+        self.executable_widget = ttk.Entry(device, textvariable=self.executable, width=26)
+        self.executable_widget.grid(row=0, column=1, sticky='ew', padx=5)
+        browse = ttk.Button(device, text='Обзор…', command=self.pick_executable)
+        browse.grid(row=0, column=2, sticky='w', padx=5)
+        self.tools_button = ttk.Button(
+            device, text='Найти Tools',
+            command=lambda: self.start_discovery(include_devices=False))
+        self.tools_button.grid(row=0, column=3, sticky='w', padx=5)
+        ttk.Label(device, text='HackRF / Serial').grid(row=0, column=4, sticky='w', padx=5)
+        self.serial_widget = ttk.Combobox(device, textvariable=self.serial, state='normal', width=23)
+        self.serial_widget.grid(row=0, column=5, sticky='ew', padx=5)
+        self.device_button = ttk.Button(
+            device, text='Найти HackRF',
+            command=lambda: self.start_discovery(include_devices=True))
+        self.device_button.grid(row=0, column=6, sticky='w', padx=5)
+        self.controls += [(self.executable_widget, 'normal'), (browse, 'normal'),
+                          (self.tools_button, 'normal'), (self.serial_widget, 'normal'),
+                          (self.device_button, 'normal')]
         self._entry(device, 'Частота центра, МГц', self.frequency, 1, 0)
         ttk.Label(device, text='Sample rate, MS/s').grid(row=1, column=2, sticky='w', padx=5)
         rate = ttk.Combobox(device, textvariable=self.sample_rate,
@@ -181,6 +199,36 @@ class EmitterApp(tk.Tk):
             filetypes=[('hackrf_transfer', 'hackrf_transfer.exe'), ('Все файлы', '*.*')])
         if path:
             self.executable.set(path)
+            self.start_discovery(include_devices=True)
+
+    def start_discovery(self, include_devices=True, silent=False):
+        if ((self.worker is not None and self.worker.is_alive()) or
+                (self.discovery_worker is not None and self.discovery_worker.is_alive())):
+            return
+        preferred = self.executable.get().strip()
+        self.tools_button.configure(state='disabled')
+        self.device_button.configure(state='disabled')
+        self.start_button.configure(state='disabled')
+        self.status.configure(text='Поиск HackRF…' if include_devices else 'Поиск HackRF Tools…')
+
+        def work():
+            try:
+                transfer = find_hackrf_transfer(preferred)
+                if not transfer:
+                    raise FileNotFoundError(
+                        'hackrf_transfer не найден в PATH или стандартных каталогах установки.')
+                self.emit('tools_found', transfer)
+                if include_devices:
+                    info_path, serials, output = discover_hackrf_devices(transfer)
+                    self.emit('devices_found', (info_path, serials, output))
+            except Exception as error:
+                self.emit('discovery_error', (str(error), silent))
+            finally:
+                self.emit('discovery_done', None)
+
+        self.discovery_worker = threading.Thread(
+            target=work, name='HackRF discovery', daemon=True)
+        self.discovery_worker.start()
 
     def pick_iq_file(self):
         path = filedialog.askopenfilename(
@@ -236,6 +284,9 @@ class EmitterApp(tk.Tk):
 
     def start(self):
         if self.worker is not None and self.worker.is_alive():
+            return
+        if self.discovery_worker is not None and self.discovery_worker.is_alive():
+            self.write_log('Дождитесь завершения поиска HackRF.')
             return
         try:
             cfg = self.settings()
@@ -298,6 +349,32 @@ class EmitterApp(tk.Tk):
             elif kind == 'error':
                 self.write_log(value)
                 messagebox.showerror('HackRF TX', value.splitlines()[-1] if value else 'Ошибка')
+            elif kind == 'tools_found':
+                self.executable.set(value)
+                self.write_log('Найден HackRF Tools: ' + value)
+            elif kind == 'devices_found':
+                info_path, serials, _output = value
+                self.serial_widget.configure(values=serials)
+                current = self.serial.get().strip()
+                if serials and not current:
+                    self.serial.set(serials[0])
+                if serials:
+                    self.write_log(f'hackrf_info: найдено устройств {len(serials)}; '
+                                   + ', '.join(serials))
+                else:
+                    self.write_log('hackrf_info не обнаружил подключённых устройств.')
+                self.write_log('Использован: ' + info_path)
+            elif kind == 'discovery_error':
+                error, silent = value
+                self.write_log('Автопоиск: ' + error)
+                if not silent:
+                    messagebox.showerror('Автопоиск HackRF', error)
+            elif kind == 'discovery_done':
+                self.tools_button.configure(state='normal')
+                self.device_button.configure(state='normal')
+                if self.worker is None or not self.worker.is_alive():
+                    self.start_button.configure(state='normal')
+                    self.status.configure(text='Остановлено')
             elif kind == 'done':
                 for widget, state in self.controls:
                     widget.configure(state=state)

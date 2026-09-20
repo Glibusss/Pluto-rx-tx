@@ -1,7 +1,5 @@
 import threading
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import radio
@@ -35,11 +33,40 @@ class StopAfterWaits:
     def wait(self,duration):self.waits+=1;return self.is_set()
 
 class RadioTests(unittest.TestCase):
+    def test_usb_discovery_prefers_pluto_and_ignores_non_usb(self):
+        contexts={
+            'ip:192.168.2.1':'Analog Devices PlutoSDR over network',
+            'usb:3.8.5':'Generic IIO USB context',
+            'usb:1.4.5':'Analog Devices Inc. PlutoSDR Rev.C',
+        }
+        found=radio.discover_pluto_usb(lambda:contexts)
+        self.assertEqual([item['uri'] for item in found],['usb:1.4.5','usb:3.8.5'])
+        self.assertTrue(found[0]['identified'])
+        self.assertFalse(found[1]['identified'])
+
+    def test_usb_discovery_wraps_scanner_failure(self):
+        def fail():
+            raise OSError('mock backend failure')
+        with self.assertRaisesRegex(RuntimeError,'сканирования'):
+            radio.discover_pluto_usb(fail)
+
     def test_noise_power_and_automatic_threshold(self):
-        self.assertAlmostEqual(radio.power_dbfs(np.full(32,radio.ADC_FULL_SCALE)),0)
-        result=radio.noise_threshold([-81,-80,-80,-79.5,-80.5])
-        self.assertAlmostEqual(result['noise_dbfs'],-80)
-        self.assertGreaterEqual(result['threshold_dbfs'],result['noise_dbfs']+3)
+        dc=np.full(32,radio.ADC_FULL_SCALE,dtype=np.complex64)
+        alternating=radio.ADC_FULL_SCALE*np.tile([1,-1],16)
+        self.assertLessEqual(radio.power_dbfs(dc),-199)
+        expected_unbiased=10*np.log10(32/31)
+        self.assertAlmostEqual(radio.power_dbfs(alternating),expected_unbiased,places=6)
+
+        base=radio.ADC_FULL_SCALE**2*1e-8
+        offsets=np.array([-.12,-.08,-.04,0,.03,.06,.09,.12]*8)
+        powers=base*10**(offsets/10)
+        powers=np.r_[powers,base*1e4]  # an impulsive interferer during calibration
+        result=radio.noise_threshold(powers,32768,false_alarm=1e-6)
+        self.assertAlmostEqual(result['noise_dbfs'],-80,places=1)
+        self.assertEqual(result['outliers'],1)
+        self.assertGreater(result['threshold_dbfs'],result['noise_dbfs'])
+        self.assertLessEqual(result['theoretical_false_alarm'],1.01e-6)
+        self.assertEqual(result['samples_per_buffer'],32768)
 
     def test_noise_calibration_reads_pluto_and_cleans_up(self):
         sdr=FakeRX()
@@ -48,6 +75,7 @@ class RadioTests(unittest.TestCase):
         with patch.object(radio,'connect',return_value=sdr):
             result=radio.calibrate_noise(dict(cfg=Config()),threading.Event(),duration=.01)
         self.assertEqual(result['buffers'],8)
+        self.assertEqual(result['samples_per_buffer'],64)
         self.assertTrue(sdr.destroyed)
 
     def test_rx_queue_capacity_is_configurable_and_bounded(self):
@@ -90,13 +118,13 @@ class RadioTests(unittest.TestCase):
         decoder.candidates=decoder.header_failures=0
         decoder.feed.side_effect=[[skipped,data,end]]
         stop=threading.Event();events=[];sdr=FakeRX()
-        with tempfile.TemporaryDirectory() as folder:
-            with patch.object(radio,'connect',return_value=sdr),patch.object(radio,'StreamDecoder',return_value=decoder):
-                radio.receive(dict(cfg=cfg),None,folder,stop,lambda *x:events.append(x))
-            saved=list(Path(folder).glob('transfer_*'))
+        with (patch.object(radio,'connect',return_value=sdr),
+              patch.object(radio,'StreamDecoder',return_value=decoder),
+              patch.object(radio.Reception,'save',return_value='mock result') as save):
+            radio.receive(dict(cfg=cfg),None,'.',stop,lambda *x:events.append(x))
         self.assertTrue(stop.is_set())
         self.assertTrue(sdr.destroyed)
-        self.assertEqual(len(saved),1)
+        save.assert_called_once_with('.',True)
         self.assertTrue(any(kind=='log' and 'RX останавливается' in value for kind,value in events))
 
     def test_tx_cleanup_on_failure(self):

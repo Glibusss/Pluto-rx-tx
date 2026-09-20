@@ -1,12 +1,18 @@
 import tempfile
 import unittest
 from pathlib import Path
+import signal
+import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 
 from hackrf_emitter import (EmitterConfig, build_command, build_cycle,
-                            complex_to_cs8, cycle_sample_count, frequency_track,
-                            load_iq_file, select_filter_bandwidth)
+                            cleanup_temp_directory, complex_to_cs8, cycle_sample_count,
+                            frequency_track,
+                            discover_hackrf_devices, find_hackrf_info,
+                            find_hackrf_transfer, load_iq_file, parse_hackrf_info,
+                            select_filter_bandwidth, stop_hackrf_process)
 
 
 class HackRFEmitterTests(unittest.TestCase):
@@ -113,6 +119,136 @@ class HackRFEmitterTests(unittest.TestCase):
         self.assertEqual(command[command.index('-a') + 1], '1')
         self.assertEqual(command[command.index('-d') + 1], '00000001')
         self.assertEqual(command[command.index('-b') + 1], str(select_filter_bandwidth(cfg)))
+
+    def test_finds_hackrf_tools_from_explicit_install_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+            self.assertEqual(Path(find_hackrf_transfer(str(transfer))), transfer.resolve())
+            self.assertEqual(Path(find_hackrf_info(str(transfer))), info.resolve())
+
+    def test_parses_and_discovers_multiple_hackrf_serials(self):
+        output = ('Found HackRF\nIndex: 0\nSerial number: 0000000000000001\n\n'
+                  'Found HackRF\nIndex: 1\nSerial number: ABCDEF0123456789\n')
+        self.assertEqual(parse_hackrf_info(output),
+                         ['0000000000000001', 'ABCDEF0123456789'])
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=output)
+
+            used_info, serials, diagnostic = discover_hackrf_devices(
+                str(transfer), runner=runner)
+            self.assertEqual(Path(used_info), info.resolve())
+            self.assertEqual(serials, ['0000000000000001', 'ABCDEF0123456789'])
+            self.assertEqual(diagnostic, output)
+            self.assertEqual(calls[0][0], [str(info.resolve())])
+
+    def test_device_discovery_treats_no_boards_as_an_empty_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+
+            def runner(_command, **_kwargs):
+                return SimpleNamespace(returncode=1, stdout='No HackRF boards found.\n')
+
+            _info, serials, _output = discover_hackrf_devices(
+                str(transfer), runner=runner)
+            self.assertEqual(serials, [])
+
+    def test_device_discovery_reports_real_hackrf_info_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+
+            def runner(_command, **_kwargs):
+                return SimpleNamespace(returncode=1, stdout='hackrf_init() failed: USB error\n')
+
+            with self.assertRaisesRegex(RuntimeError, 'кодом 1'):
+                discover_hackrf_devices(str(transfer), runner=runner)
+
+    def test_temp_cleanup_retries_a_windows_style_file_lock(self):
+        attempts = []
+        sleeps = []
+
+        def remover(path):
+            attempts.append(Path(path))
+            if len(attempts) < 3:
+                raise PermissionError(32, 'file is in use')
+
+        self.assertTrue(cleanup_temp_directory(
+            'temporary-waveform', remover=remover, sleeper=sleeps.append))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [0.05, 0.15])
+
+    def test_temp_cleanup_lock_never_escapes_to_gui(self):
+        events = []
+
+        def remover(_path):
+            raise PermissionError(32, 'file is in use')
+
+        self.assertFalse(cleanup_temp_directory(
+            'temporary-waveform', lambda *event: events.append(event),
+            remover=remover, sleeper=lambda _delay: None))
+        self.assertEqual(events[0][0], 'log')
+        self.assertIn('оставлен', events[0][1])
+
+    @unittest.skipUnless(hasattr(signal, 'CTRL_BREAK_EVENT'), 'Windows signal')
+    def test_hackrf_process_receives_graceful_ctrl_break(self):
+        class FakeProcess:
+            def __init__(self):
+                self.running = True
+                self.signals = []
+                self.terminated = False
+
+            def poll(self):
+                return None if self.running else 0
+
+            def send_signal(self, value):
+                self.signals.append(value)
+
+            def wait(self, timeout):
+                self.running = False
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+        process = FakeProcess()
+        self.assertEqual(stop_hackrf_process(process, windows=True), 'ctrl-break')
+        self.assertEqual(process.signals, [signal.CTRL_BREAK_EVENT])
+        self.assertFalse(process.terminated)
+
+    def test_unresponsive_process_is_reported_without_an_unhandled_timeout(self):
+        class StuckProcess:
+            pid = 123
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired('hackrf_transfer', timeout)
+
+        self.assertEqual(stop_hackrf_process(StuckProcess(), windows=False),
+                         'still-running')
 
 
 if __name__ == '__main__':

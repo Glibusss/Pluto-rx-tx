@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from modem import Config, MODS, frame_len, PREAMBLE
 from session import Source
-from radio import (RX_QUEUE_DEFAULT, calibrate_noise, receive,
+from radio import (RX_QUEUE_DEFAULT, calibrate_noise, discover_pluto_usb, receive,
                    rx_queue_capacity, transmit)
 
 
@@ -42,6 +42,7 @@ class App(tk.Tk):
         self.latest_lock=threading.Lock()
         self.stop_event=threading.Event()
         self.worker=None
+        self.discovery_worker=None
         self.closing=False
         self.source=None
         self.photo_refs={}
@@ -55,6 +56,7 @@ class App(tk.Tk):
         self.protocol('WM_DELETE_WINDOW',self.close)
         self.build()
         self.after(100,self.poll)
+        self.after(250,lambda:self.find_pluto(automatic=True))
 
     def build(self):
         main=ttk.Frame(self,padding=10)
@@ -79,14 +81,22 @@ class App(tk.Tk):
         for col,(label,var,width) in enumerate(entries):
             ttk.Label(rf,text=label).grid(row=0,column=col*2,sticky='w',padx=4)
             parent=rf
-            if var is self.gain:
+            if var is self.uri or var is self.gain:
                 parent=ttk.Frame(rf)
                 parent.grid(row=0,column=col*2+1,padx=4,sticky='ew')
-            w=ttk.Entry(parent,textvariable=var,width=width)
+            if var is self.uri:
+                w=ttk.Combobox(parent,textvariable=var,width=width,state='normal')
+                w.pack(side='left',fill='x',expand=True)
+                self.uri_widget=w
+                self.discovery_button=ttk.Button(parent,text='Найти USB',command=self.find_pluto)
+                self.discovery_button.pack(side='left',padx=(7,0))
+                self.controls.append((self.discovery_button,'normal'))
+            else:
+                w=ttk.Entry(parent,textvariable=var,width=width)
             if var is self.gain:
                 w.pack(side='left')
                 ttk.Label(parent,textvariable=self.gain_info).pack(side='left',padx=(7,0))
-            else:
+            elif var is not self.uri:
                 w.grid(row=0,column=col*2+1,padx=4,sticky='ew')
             self.controls.append((w,'normal'))
         self.gain.trace_add('write',self.update_gain_info)
@@ -242,6 +252,22 @@ class App(tk.Tk):
         path=filedialog.askdirectory()
         if path:self.folder.set(path)
 
+    def find_pluto(self,automatic=False):
+        if self.discovery_worker and self.discovery_worker.is_alive():
+            return
+        initial_uri=self.uri.get()
+        self.discovery_button.configure(state='disabled')
+        if not automatic:
+            self.write_log('Поиск Pluto среди USB-контекстов libiio…')
+        def work():
+            try:
+                found=discover_pluto_usb()
+                self.events.put(('discovery',(found,initial_uri,automatic)))
+            except Exception as error:
+                self.events.put(('discovery_error',(str(error),automatic)))
+        self.discovery_worker=threading.Thread(target=work,name='Pluto USB discovery',daemon=True)
+        self.discovery_worker.start()
+
     def show_image(self,label,im,key):
         im=im.copy()
         im.thumbnail((530,410))
@@ -391,12 +417,48 @@ class App(tk.Tk):
                 self.write_log(value)
                 if kind=='error':self.tabs.select(self.log)
             elif kind=='calibration':
-                self.squelch_threshold.set(f'{value["threshold_dbfs"]:.1f}')
+                # CFAR margins can be fractions of a decibel; keep enough precision
+                # when transferring the calibrated threshold into the editable field.
+                self.squelch_threshold.set(f'{value["threshold_dbfs"]:.2f}')
                 self.squelch.set(True)
                 self.write_log(f'Калибровка завершена: шум {value["noise_dbfs"]:.1f} dBFS, '+
-                    f'порог {value["threshold_dbfs"]:.1f} dBFS, измерено буферов: {value["buffers"]}.')
+                    f'σ мощности {value["spread_db"]:.2f} dB, порог {value["threshold_dbfs"]:.1f} dBFS '+
+                    f'(P_FA≤{value["false_alarm_probability"]:.0e}), '
+                    f'буферов {value["used_buffers"]}/{value["buffers"]}, '
+                    f'выбросов {value["outliers"]}.')
+            elif kind=='discovery':
+                found,initial_uri,automatic=value
+                self.discovery_worker=None
+                uris=[item['uri'] for item in found]
+                self.uri_widget.configure(values=uris)
+                running=self.worker and self.worker.is_alive()
+                if not running:
+                    self.discovery_button.configure(state='normal')
+                if found:
+                    confirmed=next((item for item in found if item['identified']),None)
+                    # Never overwrite text typed while a scan was running.
+                    if confirmed and not running and self.uri.get()==initial_uri:
+                        self.uri.set(confirmed['uri'])
+                    selected=confirmed or found[0]
+                    description=f' — {selected["description"]}' if selected['description'] else ''
+                    suffix=(f'; всего USB-контекстов: {len(found)}. Выберите URI из списка.'
+                            if len(found)>1 else '.')
+                    label=('Pluto USB' if confirmed else
+                           'USB IIO-контекст (описание не подтверждает Pluto)')
+                    self.write_log(f'Найден {label}: {selected["uri"]}{description}{suffix}')
+                else:
+                    self.write_log('Pluto через USB backend не найден; ручной URI оставлен без изменений.')
+            elif kind=='discovery_error':
+                error,automatic=value
+                self.discovery_worker=None
+                if not (self.worker and self.worker.is_alive()):
+                    self.discovery_button.configure(state='normal')
+                self.write_log(('Автопоиск' if automatic else 'Поиск USB')+': '+error+
+                               '. Ручной URI оставлен без изменений.')
             elif kind=='done':
                 for widget,state in self.controls:widget.configure(state=state)
+                if self.discovery_worker and self.discovery_worker.is_alive():
+                    self.discovery_button.configure(state='disabled')
                 self.start_btn.configure(state='normal')
                 self.stop_btn.configure(state='disabled')
                 self.status.configure(text='Остановлено')

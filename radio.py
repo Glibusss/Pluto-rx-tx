@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 import numpy as np
+from scipy.stats import f as fisher_f, norm
 from modem import Config, make_frame, StreamDecoder
 from session import Reception
 
@@ -15,6 +16,35 @@ RX_QUEUE_MIN = 16
 RX_QUEUE_DEFAULT = 512
 RX_QUEUE_MAX = 8192
 ADC_FULL_SCALE = 2048.0
+NOISE_FALSE_ALARM = 1e-6
+NOISE_OUTLIER_SIGMAS = 5.0
+
+
+def discover_pluto_usb(scan=None):
+    """Return USB IIO contexts, with contexts identified as Pluto first."""
+    if scan is None:
+        try:
+            import iio
+        except (ImportError,OSError) as error:
+            raise RuntimeError('Не удалось загрузить libiio для поиска Pluto: '+str(error)) from error
+        scan=iio.scan_contexts
+    try:
+        contexts=scan()
+    except Exception as error:
+        raise RuntimeError('Ошибка сканирования USB-контекстов libiio: '+str(error)) from error
+    if not hasattr(contexts,'items'):
+        raise RuntimeError('libiio вернул некорректный результат сканирования')
+    result=[]
+    for uri,description in contexts.items():
+        uri=str(uri)
+        if not uri.lower().startswith('usb:'):
+            continue
+        description='' if description is None else str(description)
+        text=description.lower()
+        identified='pluto' in text or 'adalm' in text
+        result.append(dict(uri=uri,description=description,identified=identified))
+    result.sort(key=lambda item:(not item['identified'],item['uri']))
+    return result
 
 
 def rx_queue_capacity(settings):
@@ -27,23 +57,76 @@ def rx_queue_capacity(settings):
     return value
 
 
-def power_dbfs(iq):
-    samples=np.asarray(iq)
-    if not samples.size:
+def iq_variance(iq):
+    """Unbiased complex variance after removing the buffer's DC component."""
+    samples=np.asarray(iq).ravel()
+    if samples.size<2:
         raise ValueError('Пустой IQ-буфер')
-    power=float(np.mean(abs(samples)**2))
-    return 10*math.log10(max(power/(ADC_FULL_SCALE**2),1e-20))
+    mean=np.mean(samples,dtype=np.complex128)
+    second=float(np.mean(abs(samples)**2,dtype=np.float64))
+    variance=max(0.,second-float(abs(mean)**2))*samples.size/(samples.size-1)
+    return variance
 
 
-def noise_threshold(buffer_dbfs):
-    values=np.asarray(buffer_dbfs,float)
-    if not values.size or not np.all(np.isfinite(values)):
+def dbfs_from_power(power):
+    return 10*math.log10(max(float(power)/(ADC_FULL_SCALE**2),1e-20))
+
+
+def power_dbfs(iq):
+    return dbfs_from_power(iq_variance(iq))
+
+
+def noise_threshold(buffer_powers, samples_per_buffer, false_alarm=NOISE_FALSE_ALARM):
+    """Robust calibrated energy-detector threshold.
+
+    For circular complex Gaussian noise, a ratio of the current unbiased power
+    estimate to the calibrated estimate follows Fisher's F distribution.  MAD
+    clipping prevents occasional transmissions/impulses from poisoning the
+    reference estimate; it is not used as a substitute for the CFAR model.
+    """
+    powers=np.asarray(buffer_powers,float)
+    samples=int(samples_per_buffer)
+    if (powers.size<4 or samples<2 or not np.all(np.isfinite(powers)) or
+            np.any(powers<0) or not 0<float(false_alarm)<.5):
         raise ValueError('Нет корректных измерений шума')
-    noise=float(np.median(values))
-    high=float(np.quantile(values,.99))
-    threshold=max(noise+3,high+1)
-    return dict(noise_dbfs=noise,threshold_dbfs=threshold,
-                spread_db=float(np.std(values)),buffers=len(values))
+    floor=ADC_FULL_SCALE**2*1e-20
+    powers=np.maximum(powers,floor)
+    levels=10*np.log10(powers/(ADC_FULL_SCALE**2))
+
+    center=float(np.median(levels))
+    sigma_db=1.4826*float(np.median(abs(levels-center)))
+    clip_db=max(.25,NOISE_OUTLIER_SIGMAS*sigma_db)
+    inliers=abs(levels-center)<=clip_db
+    if int(np.count_nonzero(inliers))<max(3,math.ceil(len(levels)/2)):
+        inliers=np.ones(len(levels),bool)
+
+    selected=powers[inliers]
+    selected_levels=levels[inliers]
+    noise_power=float(np.mean(selected))
+    robust_center=float(np.median(selected_levels))
+    spread_db=1.4826*float(np.median(abs(selected_levels-robust_center)))
+    used=len(selected)
+
+    # Each complex buffer variance has 2(N-1) real degrees of freedom.  The
+    # reference is the mean of `used` independent buffers, hence the F ratio.
+    test_dof=2*(samples-1)
+    reference_dof=test_dof*used
+    cfar_factor=float(fisher_f.ppf(1-false_alarm,test_dof,reference_dof))
+
+    # Real receivers drift more than the ideal Gaussian model.  Model the
+    # observed buffer-to-buffer log-power variation and use the stricter limit.
+    z=float(norm.isf(false_alarm))
+    empirical_factor=10**(z*spread_db/10)
+    threshold_factor=max(cfar_factor,empirical_factor)
+    threshold_power=noise_power*threshold_factor
+    theoretical_pfa=float(fisher_f.sf(threshold_factor,test_dof,reference_dof))
+    return dict(noise_dbfs=dbfs_from_power(noise_power),
+                threshold_dbfs=dbfs_from_power(threshold_power),
+                threshold_margin_db=10*math.log10(threshold_factor),
+                spread_db=spread_db,buffers=len(powers),used_buffers=used,
+                outliers=len(powers)-used,samples_per_buffer=samples,
+                false_alarm_probability=float(false_alarm),
+                theoretical_false_alarm=theoretical_pfa)
 
 
 def calibrate_noise(settings, stop, duration=2.0):
@@ -51,12 +134,18 @@ def calibrate_noise(settings, stop, duration=2.0):
     try:
         sdr=connect(settings,False)
         count=max(8,math.ceil(duration*int(sdr.sample_rate)/int(sdr.rx_buffer_size)))
-        levels=[]
+        powers=[]
+        samples_per_buffer=None
         for _ in range(count):
             if stop.is_set():
                 return None
-            levels.append(power_dbfs(sdr.rx()))
-        return noise_threshold(levels)
+            raw=np.asarray(sdr.rx()).ravel()
+            if samples_per_buffer is None:
+                samples_per_buffer=len(raw)
+            elif len(raw)!=samples_per_buffer:
+                raise RuntimeError('Pluto вернул IQ-буферы разного размера при калибровке')
+            powers.append(iq_variance(raw))
+        return noise_threshold(powers,samples_per_buffer)
     finally:
         if sdr is not None:
             sdr.rx_destroy_buffer()
@@ -189,8 +278,8 @@ def receive(settings, reference, folder, stop, emit):
                     iq=raw*mixer
                     offset=(offset+len(raw))%4
                     clipping=float(np.mean((abs(raw.real)>=32760)|(abs(raw.imag)>=32760)))
-                    raw_power=float(np.mean(abs(raw)**2))
-                    input_dbfs[0]=10*math.log10(max(raw_power/(ADC_FULL_SCALE**2),1e-20))
+                    raw_power=iq_variance(raw)
+                    input_dbfs[0]=dbfs_from_power(raw_power)
                     if threshold_power is None:
                         enqueue((iq,clipping))
                     elif raw_power>=threshold_power:
