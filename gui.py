@@ -17,6 +17,40 @@ from radio import (RX_QUEUE_DEFAULT, calibrate_noise, discover_pluto_usb, receiv
                    rx_queue_capacity, transmit)
 
 
+APP_ICON_SIZE=32
+APP_ICON_BACKGROUND='#202124'
+APP_ICON_SIGNAL='#66d17a'
+
+
+def app_icon_pixels(size=APP_ICON_SIZE):
+    """Return a deterministic radio-signal icon; no external icon file needed."""
+    if size<16:
+        raise ValueError('Размер иконки должен быть не меньше 16 пикселей')
+    cx=(size-1)/2
+    cy=size*.72
+    scale=size/32
+    pixels=[]
+    for y in range(size):
+        row=[]
+        for x in range(size):
+            distance=math.hypot(x-cx,y-cy)
+            arcs=(y<cy-2*scale and
+                  (abs(distance-7*scale)<=1.05*scale or
+                   abs(distance-12*scale)<=1.05*scale))
+            mast=abs(x-cx)<=1.05*scale and cy-6*scale<=y<=cy
+            source=distance<=2.35*scale
+            row.append(APP_ICON_SIGNAL if arcs or mast or source else APP_ICON_BACKGROUND)
+        pixels.append(tuple(row))
+    return tuple(pixels)
+
+
+def make_app_icon(master):
+    image=tk.PhotoImage(master=master,width=APP_ICON_SIZE,height=APP_ICON_SIZE)
+    for y,row in enumerate(app_icon_pixels()):
+        image.put('{'+ ' '.join(row) +'}',to=(0,y))
+    return image
+
+
 def gain_power_text(value):
     """Describe an AD936x gain value as an ideal linear power ratio."""
     try:
@@ -33,6 +67,8 @@ def gain_power_text(value):
 class App(tk.Tk):
     def __init__(self, tx):
         super().__init__()
+        self.app_icon=make_app_icon(self)
+        self.iconphoto(True,self.app_icon)
         self.tx=tx
         self.title('PlutoSDR — '+('Передатчик' if tx else 'Приёмник / BER / PER'))
         self.geometry('1200x850')
