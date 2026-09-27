@@ -20,10 +20,25 @@ RX_QUEUE_MIN = 16
 RX_QUEUE_DEFAULT = 512
 RX_QUEUE_MAX = 8192
 ADC_FULL_SCALE = 2048.0
+# ADI's TX HDL consumes signed 16-bit samples before dropping the low 4 bits.
+# One common scale leaves headroom for OOK and QAM peaks as well as PSK/FSK.
+TX_DIGITAL_FULL_SCALE = 32768.0
+TX_AMPLITUDE_DEFAULT = 16384.0
+TX_AMPLITUDE_MAX = 16384.0
 NOISE_FALSE_ALARM = 1e-6
 NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
 PROCESSING_REVISION = 'cached-ls-fft-v1'
+
+
+def tx_amplitude(settings):
+    try:
+        value = float(str(settings.get('tx_amplitude',TX_AMPLITUDE_DEFAULT)).replace(',','.'))
+    except (TypeError,ValueError) as error:
+        raise ValueError('Цифровая амплитуда TX: 1…16384') from error
+    if not math.isfinite(value) or not 1<=value<=TX_AMPLITUDE_MAX:
+        raise ValueError('Цифровая амплитуда TX: 1…16384')
+    return value
 
 
 def clipping_fraction(iq):
@@ -52,7 +67,11 @@ def experiment_settings(settings, sdr=None, tx=False):
         'uri','frequency','gain','queue_buffers','squelch_dbfs',
         'environment_dbfs','receiver_noise_dbfs')
     result.update({name:settings[name] for name in names if name in settings})
-    if not tx:
+    if tx:
+        amplitude = tx_amplitude(settings)
+        result.update(tx_amplitude=amplitude,tx_digital_full_scale=TX_DIGITAL_FULL_SCALE,
+                      tx_unit_symbol_dbfs=20*math.log10(amplitude/TX_DIGITAL_FULL_SCALE))
+    else:
         result['queue_buffers'] = rx_queue_capacity(settings)
         result['gain_mode'] = 'manual'
         result['acquisition'] = 'first valid header; start RX before TX'
@@ -258,8 +277,12 @@ def transmit(settings, source, stop, emit):
     size=None
     try:
         cfg=settings['cfg']
+        amplitude=tx_amplitude(settings)
         sdr=connect(settings,True)
         emit('log',f'Pluto подключён. TX LO={int(sdr.tx_lo)} Гц, Fs={int(sdr.sample_rate)}')
+        emit('log',f'Цифровая амплитуда TX={amplitude:g}; '
+             f'единичный символ {20*math.log10(amplitude/TX_DIGITAL_FULL_SCALE):.2f} dBFS. '
+             'Один масштаб для всех модуляций; TX gain задаётся отдельно в dB.')
         if settings.get('results_folder'):
             journal=run_path(settings['results_folder'],'tx','.jsonl')
             emit('log','Журнал попыток TX: '+str(journal))
@@ -286,7 +309,7 @@ def transmit(settings, source, stop, emit):
                 gap=np.zeros(int(cfg.sample_rate*0.012),np.complex64)
                 frame=np.r_[gap,frame,gap]
                 frame=np.pad(frame,(0,(-len(frame))%4))
-                iq=(frame*4096*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
+                iq=(frame*amplitude*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
                 size=len(iq)
                 sdr.tx(iq)
                 # Count submitted buffers even if Stop interrupts the subsequent wait.

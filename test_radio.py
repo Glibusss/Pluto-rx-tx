@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import radio
-from modem import Config, StreamDecoder, PREAMBLE, decode_frame, make_frame
+from modem import Config, MODS, StreamDecoder, PREAMBLE, decode_frame, make_frame
 from session import Source
 
 class FakeTX:
@@ -102,7 +102,7 @@ class RadioTests(unittest.TestCase):
         decoder=StreamDecoder(settings['cfg'])
         packets=[]
         for iq in sdr.calls:
-            iq=iq/4096*np.exp(-2j*np.pi*.25*np.arange(len(iq)))
+            iq=iq/radio.TX_AMPLITUDE_DEFAULT*np.exp(-2j*np.pi*.25*np.arange(len(iq)))
             packets+=decoder.feed(iq)
         self.assertEqual(len(packets),8)
         data_packets=[p for p in packets if not p.meta.end]
@@ -110,6 +110,52 @@ class RadioTests(unittest.TestCase):
         self.assertNotEqual(data_packets[0].meta.transfer,data_packets[1].meta.transfer)
         self.assertEqual(sum(p.meta.end for p in packets),6)
         self.assertIn(('progress',(0,source.total,2)),events)
+
+    def test_tx_scale_preserves_payload_and_dac_headroom_for_all_modes(self):
+        source=Source.text('Power scale test '*48)
+        for mod in MODS:
+            for preamble in (False,True):
+                for cp in (False,True):
+                    for rate in (1000000,2000000):
+                        with self.subTest(mod=mod,preamble=preamble,cp=cp,rate=rate):
+                            cfg=Config(mod,preamble,cp,rate,0)
+                            sdr=FakeTX();sdr.sample_rate=rate
+                            with patch.object(radio,'connect',return_value=sdr),patch.object(radio.time,'sleep'):
+                                radio.transmit(dict(cfg=cfg,gap_ms=0),source,StopAfterWaits(1),lambda *x:None)
+                            iq=sdr.calls[0]
+                            self.assertLess(np.max(abs(iq)),radio.TX_DIGITAL_FULL_SCALE-1)
+                            # Include the driver's integer conversion and discarded low 4 bits.
+                            codes=np.floor(iq.real/16)+1j*np.floor(iq.imag/16)
+                            baseband=codes*16/radio.TX_AMPLITUDE_DEFAULT*np.exp(-2j*np.pi*.25*np.arange(len(iq)))
+                            packets=StreamDecoder(cfg).feed(baseband)
+                            self.assertEqual(len(packets),1)
+                            self.assertTrue(packets[0].crc_ok)
+                            self.assertEqual(packets[0].payload,source.payload(0))
+
+    def test_tx_can_reproduce_old_scale_and_logs_power_change(self):
+        source=Source.text('same experiment');records=[];signals=[]
+        for amplitude in (4096,radio.TX_AMPLITUDE_DEFAULT):
+            sdr=FakeTX()
+            with (patch.object(radio,'connect',return_value=sdr),patch.object(radio.time,'sleep'),
+                  patch.object(radio.secrets,'randbits',return_value=77),
+                  patch.object(radio,'append_attempt',side_effect=lambda path,row:records.append(row))):
+                radio.transmit(dict(cfg=Config(),gap_ms=0,tx_amplitude=amplitude),
+                               source,StopAfterWaits(1),lambda *x:None)
+            signals.append(sdr.calls[0])
+        np.testing.assert_array_equal(signals[1],signals[0]*4)
+        old,new=[r['transmitter_settings'] for r in records if r['event']=='start']
+        self.assertEqual(old['tx_amplitude'],4096)
+        self.assertEqual(new['tx_amplitude'],16384)
+        self.assertEqual(new['tx_digital_full_scale'],32768)
+        self.assertAlmostEqual(new['tx_unit_symbol_dbfs']-old['tx_unit_symbol_dbfs'],12.0411998266)
+
+    def test_invalid_tx_scale_is_rejected_before_opening_sdr(self):
+        for amplitude in (0,-1,16385,float('nan'),float('inf'),'bad'):
+            with self.subTest(amplitude=amplitude),patch.object(radio,'connect') as connect:
+                with self.assertRaisesRegex(ValueError,'амплитуда'):
+                    radio.transmit(dict(cfg=Config(),tx_amplitude=amplitude),
+                                   Source.text('test'),NoWait(),lambda *x:None)
+                connect.assert_not_called()
 
     def test_rx_stops_on_end_and_saves_run_settings(self):
         cfg=Config()

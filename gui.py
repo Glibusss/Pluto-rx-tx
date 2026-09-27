@@ -13,8 +13,8 @@ import numpy as np
 from PIL import Image, ImageTk
 from modem import Config, MODS, frame_len, PREAMBLE
 from session import Source
-from radio import (RX_QUEUE_DEFAULT, calibrate_noise, discover_pluto_usb, receive,
-                   rx_queue_capacity, transmit)
+from radio import (RX_QUEUE_DEFAULT, TX_AMPLITUDE_DEFAULT, calibrate_noise,
+                   discover_pluto_usb, receive, rx_queue_capacity, transmit, tx_amplitude)
 
 
 APP_ICON_SIZE=32
@@ -105,7 +105,8 @@ class App(tk.Tk):
         self.freq=tk.StringVar(value='2400')
         self.mod=tk.StringVar(value='BPSK')
         self.rate=tk.StringVar(value='1')
-        self.gain=tk.StringVar(value='-30' if self.tx else '20')
+        self.gain=tk.StringVar(value='-10' if self.tx else '20')
+        self.tx_amplitude=tk.StringVar(value=f'{TX_AMPLITUDE_DEFAULT:g}')
         self.gain_info=tk.StringVar(value=gain_power_text(self.gain.get()))
         self.cfo=tk.StringVar(value='40000')
         self.gap=tk.StringVar(value='20')
@@ -165,7 +166,15 @@ class App(tk.Tk):
             w.pack(side='left')
             self.controls.append((w,'normal'))
         ttk.Label(options,text='Заголовок BPSK; RGB-блок 16×16; пилоты в каждом блоке').pack(side='left',padx=12)
-        if not self.tx:
+        if self.tx:
+            amplitude=ttk.Frame(rf)
+            amplitude.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
+            ttk.Label(amplitude,text='Цифровая амплитуда TX:').pack(side='left',padx=5)
+            w=ttk.Entry(amplitude,textvariable=self.tx_amplitude,width=9)
+            w.pack(side='left')
+            self.controls.append((w,'normal'))
+            ttk.Label(amplitude,text='1…16384; прежний уровень 4096. Фиксируйте при сравнении модуляций.').pack(side='left',padx=8)
+        else:
             squelch=ttk.Frame(rf)
             squelch.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
             environment=ttk.Frame(squelch)
@@ -357,11 +366,14 @@ class App(tk.Tk):
             if not -150<=squelch_dbfs<=10:
                 raise ValueError('Порог фона: -150…10 dBFS')
         if not self.uri.get().strip():raise ValueError('Введите URI Pluto')
-        return dict(cfg=cfg,frequency=freq,gain=gain,gap_ms=gap,uri=self.uri.get().strip(),
-                    queue_buffers=queue_buffers,squelch_dbfs=squelch_dbfs,
-                    environment_dbfs=self.environment_dbfs,
-                    receiver_noise_dbfs=self.receiver_noise_dbfs,
-                    results_folder=self.folder.get())
+        settings=dict(cfg=cfg,frequency=freq,gain=gain,gap_ms=gap,uri=self.uri.get().strip(),
+                      queue_buffers=queue_buffers,squelch_dbfs=squelch_dbfs,
+                      environment_dbfs=self.environment_dbfs,
+                      receiver_noise_dbfs=self.receiver_noise_dbfs,
+                      results_folder=self.folder.get())
+        if self.tx:
+            settings['tx_amplitude']=tx_amplitude({'tx_amplitude':self.tx_amplitude.get()})
+        return settings
 
     def calibrate_environment(self):
         self._start_calibration('environment')

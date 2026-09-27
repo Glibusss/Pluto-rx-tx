@@ -4,6 +4,7 @@ from unittest.mock import Mock,patch
 
 from gui import (APP_ICON_BACKGROUND, APP_ICON_SIGNAL, App, app_icon_pixels,
                  gain_power_text)
+from modem import Config
 
 
 class GuiTests(unittest.TestCase):
@@ -18,6 +19,20 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(gain_power_text('-30'),'линейно по мощности: ×0,001')
         self.assertEqual(gain_power_text('20'),'линейно по мощности: ×100')
         self.assertEqual(gain_power_text('bad'),'линейно по мощности: —')
+
+    def test_tx_settings_include_selected_digital_amplitude(self):
+        values=dict(mod='BPSK',pre=True,cp=False,rate='1',cfo='40000',gain='-10',
+                    freq='2400',gap='20',queue_buffers='512',uri='usb:1.2.3',
+                    folder='received',tx_amplitude='4096')
+        app=SimpleNamespace(tx=True,environment_dbfs=None,receiver_noise_dbfs=None,
+                            **{name:Mock(get=Mock(return_value=value)) for name,value in values.items()})
+        settings=App.settings(app)
+        self.assertEqual(settings['cfg'],Config())
+        self.assertEqual(settings['tx_amplitude'],4096)
+        self.assertEqual(settings['gain'],-10)
+        app.tx_amplitude.get.return_value='20000'
+        with self.assertRaisesRegex(ValueError,'амплитуда'):
+            App.settings(app)
 
     def test_receiver_noise_calibration_requires_50_ohm_warning(self):
         app=SimpleNamespace(tx=False,worker=None,_start_calibration=Mock())
