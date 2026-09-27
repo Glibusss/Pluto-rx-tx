@@ -1,5 +1,9 @@
 from __future__ import annotations
 from collections import deque
+from dataclasses import asdict
+from datetime import datetime, timezone
+from functools import lru_cache
+import json
 import math
 import queue
 import secrets
@@ -8,7 +12,7 @@ import time
 from pathlib import Path
 import numpy as np
 from scipy.stats import f as fisher_f, norm
-from modem import Config, make_frame, StreamDecoder
+from modem import Config, SPS, make_frame, StreamDecoder
 from session import Reception
 
 
@@ -18,6 +22,66 @@ RX_QUEUE_MAX = 8192
 ADC_FULL_SCALE = 2048.0
 NOISE_FALSE_ALARM = 1e-6
 NOISE_OUTLIER_SIGMAS = 5.0
+RX_SNAPSHOT_INTERVAL = 0.1
+PROCESSING_REVISION = 'cached-ls-fft-v1'
+
+
+def clipping_fraction(iq):
+    """Fraction near the AD936x signed 12-bit I/Q rails, including a margin."""
+    samples = np.asarray(iq)
+    if not samples.size:
+        return 0.
+    limit = ADC_FULL_SCALE - 8
+    return float(np.mean((abs(samples.real)>=limit) | (abs(samples.imag)>=limit)))
+
+
+@lru_cache(maxsize=8)
+def rx_mixer(length, offset):
+    wave = np.array([1,-1j,-1,1j],np.complex64)[(np.arange(length)+offset)%4]
+    wave.setflags(write=False)
+    return wave
+
+
+def experiment_settings(settings, sdr=None, tx=False):
+    """Serializable requested settings and hardware values actually read back."""
+    result = dict(processing_revision=PROCESSING_REVISION, phy_version=1,
+                  cfg=asdict(settings['cfg']), samples_per_symbol=SPS,
+                  payload_fec=False, header_decoder='hard-majority',
+                  adc_full_scale=ADC_FULL_SCALE)
+    names = ('uri','frequency','gain','gap_ms') if tx else (
+        'uri','frequency','gain','queue_buffers','squelch_dbfs',
+        'environment_dbfs','receiver_noise_dbfs')
+    result.update({name:settings[name] for name in names if name in settings})
+    if not tx:
+        result['queue_buffers'] = rx_queue_capacity(settings)
+        result['gain_mode'] = 'manual'
+        result['acquisition'] = 'first valid header; start RX before TX'
+    if sdr is not None:
+        prefix = 'tx' if tx else 'rx'
+        actual = {}
+        for name in ('sample_rate',prefix+'_lo',prefix+'_rf_bandwidth',prefix+'_hardwaregain_chan0'):
+            value = getattr(sdr,name,None)
+            if value is not None:
+                actual[name] = float(value) if 'gain' in name else int(value)
+        result['actual'] = actual
+    return result
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_path(folder, role, suffix):
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    path = Path(folder)/(role+'_runs')/(stamp+'_'+secrets.token_hex(4)+suffix)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    return path
+
+
+def append_attempt(path, record):
+    if path is not None:
+        with path.open('a',encoding='utf-8') as stream:
+            stream.write(json.dumps(record,ensure_ascii=False)+'\n')
 
 
 def discover_pluto_usb(scan=None):
@@ -187,18 +251,31 @@ def connect(settings, tx=False):
 
 def transmit(settings, source, stop, emit):
     sdr=None
+    journal=None
+    attempt=None
+    failure=None
+    sent=end_sent=0
+    size=None
     try:
         cfg=settings['cfg']
         sdr=connect(settings,True)
         emit('log',f'Pluto подключён. TX LO={int(sdr.tx_lo)} Гц, Fs={int(sdr.sample_rate)}')
-        size=None
+        if settings.get('results_folder'):
+            journal=run_path(settings['results_folder'],'tx','.jsonl')
+            emit('log','Журнал попыток TX: '+str(journal))
+        run_settings=experiment_settings(settings,sdr,tx=True)
         cycle=0
         while not stop.is_set():
             cycle+=1
             tid=secrets.randbits(64)
+            sent=end_sent=0
+            attempt=dict(event='start',time_utc=utc_now(),transfer=f'{tid:016x}',
+                cycle=cycle,expected_packets=source.total,source_bytes=len(source.raw),
+                kind='RGB' if source.kind else 'text',width=source.width,height=source.height,
+                source_digest=source.digest.hex(),transmitter_settings=run_settings)
+            append_attempt(journal,attempt)
             emit('log',f'Цикл {cycle}, передача {tid:016x}: {source.total} пакетов, {len(source.raw)} байт')
             emit('progress',(0,source.total,cycle))
-            sent=end_sent=0
             # END is control, repeated 3 times. Each cycle has a fresh transfer ID.
             for index in range(source.total+3):
                 if stop.is_set():
@@ -212,29 +289,44 @@ def transmit(settings, source, stop, emit):
                 iq=(frame*4096*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
                 size=len(iq)
                 sdr.tx(iq)
-                # push completion need not mean last DAC sample; conservatively wait a full buffer.
-                stop.wait(size/cfg.sample_rate + settings['gap_ms']/1000)
+                # Count submitted buffers even if Stop interrupts the subsequent wait.
                 if end:
                     end_sent+=1
                 else:
                     sent+=1
+                # push completion need not mean last DAC sample; conservatively wait a full buffer.
+                stop.wait(size/cfg.sample_rate + settings['gap_ms']/1000)
+                if not end:
                     emit('progress',(sent,source.total,cycle))
             complete=sent==source.total and end_sent==3
+            append_attempt(journal,dict(event='finish',time_utc=utc_now(),
+                transfer=attempt['transfer'],status='complete' if complete else 'cancelled',
+                submitted_data_packets=sent,submitted_end_packets=end_sent))
+            attempt=None
             tail=('Отправлен END; '+('остановлено пользователем.' if stop.is_set()
                                      else 'начинаю следующий цикл.')) if complete else 'Остановлено пользователем.'
             emit('log',f'Цикл {cycle}: в SDR отправлено {sent}/{source.total} пакетов. '+tail)
             if not complete:
                 break
+    except Exception as error:
+        failure=str(error)
+        raise
     finally:
-        if sdr is not None:
-            try:
-                if size:
-                    sdr.tx(np.zeros(size,np.complex64))
-                    time.sleep(size/settings['cfg'].sample_rate + .02)
-            finally:
-                sdr.tx_destroy_buffer()
-                # Explicitly suppress RF level after the final flush.
-                sdr.tx_hardwaregain_chan0=-89.75
+        try:
+            if attempt is not None:
+                append_attempt(journal,dict(event='finish',time_utc=utc_now(),
+                    transfer=attempt['transfer'],status='failed' if failure else 'cancelled',
+                    error=failure,submitted_data_packets=sent,submitted_end_packets=end_sent))
+        finally:
+            if sdr is not None:
+                try:
+                    if size:
+                        sdr.tx(np.zeros(size,np.complex64))
+                        time.sleep(size/settings['cfg'].sample_rate + .02)
+                finally:
+                    sdr.tx_destroy_buffer()
+                    # Explicitly suppress RF level after the final flush.
+                    sdr.tx_hardwaregain_chan0=-89.75
 
 
 def receive(settings, reference, folder, stop, emit):
@@ -247,15 +339,25 @@ def receive(settings, reference, folder, stop, emit):
     squelched=[0]
     input_dbfs=[None]
     session=None
+    run_started=utc_now()
+    run_clock=time.monotonic()
+    run_settings=experiment_settings(settings)
+    results=[]
+    failure=None
+    clipped_samples=[0]
+    captured_samples=[0]
+    last_snapshot=-float('inf')
+    snapshot_dirty=False
     decoder=StreamDecoder(settings['cfg'])
     threshold_dbfs=settings.get('squelch_dbfs')
     threshold_power=(None if threshold_dbfs is None else
                      ADC_FULL_SCALE**2*10**(float(threshold_dbfs)/10))
     try:
         sdr=connect(settings,False)
+        run_settings=experiment_settings(settings,sdr)
         emit('log',f'Pluto подключён. RX LO={int(sdr.rx_lo)} Гц. Приём до Stop.')
         if threshold_dbfs is not None:
-            emit('log',f'Шумовой порог включён: {float(threshold_dbfs):.1f} dBFS.')
+            emit('log',f'Порог эфирного фона включён: {float(threshold_dbfs):.1f} dBFS.')
         def collect():
             offset=0
             gap=False
@@ -274,10 +376,11 @@ def receive(settings, reference, folder, stop, emit):
                 while not capture_stop.is_set():
                     raw=np.asarray(sdr.rx(),np.complex64)
                     # fs/4 oscillator has exactly four states, no growing float phase.
-                    mixer=np.array([1,-1j,-1,1j],np.complex64)[(np.arange(len(raw))+offset)%4]
-                    iq=raw*mixer
+                    iq=raw*rx_mixer(len(raw),offset)
                     offset=(offset+len(raw))%4
-                    clipping=float(np.mean((abs(raw.real)>=32760)|(abs(raw.imag)>=32760)))
+                    clipping=clipping_fraction(raw)
+                    clipped_samples[0]+=int(round(clipping*len(raw)))
+                    captured_samples[0]+=len(raw)
                     raw_power=iq_variance(raw)
                     input_dbfs[0]=dbfs_from_power(raw_power)
                     if threshold_power is None:
@@ -311,6 +414,11 @@ def receive(settings, reference, folder, stop, emit):
                 iq,gap,clipping=frames.get(timeout=.15)
             except queue.Empty:
                 now=time.monotonic()
+                if session and snapshot_dirty and now-last_snapshot>=RX_SNAPSHOT_INTERVAL:
+                    session.transport_drops=dropped[0]
+                    emit('snapshot',session.snapshot())
+                    snapshot_dirty=False
+                    last_snapshot=now
                 if now-last>.5:
                     emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
                         queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
@@ -328,44 +436,68 @@ def receive(settings, reference, folder, stop, emit):
                 emit('log','Обнаружено ограничение I/Q. Уменьшите RX gain / уровень TX.')
             packets=decoder.feed(iq,stop)
             for packet in packets:
-                # Continuous TX repeats transfers. Start only at packet zero so an
-                # RX launched in the middle of a cycle waits for one complete result.
-                if ((session is None or session.meta.transfer != packet.meta.transfer) and
-                        (packet.meta.end or packet.meta.seq != 0)):
-                    continue
+                # Every header carries the expected count. Losing packet zero
+                # must not exclude the rest of the same laboratory attempt.
                 if session is None or session.meta.transfer != packet.meta.transfer:
                     if session is not None:
+                        session.transport_drops=dropped[0]
+                        results.append(session.stats(True))
                         emit('log','Предыдущий результат: '+session.save(folder,True))
-                    session=Reception(packet.meta,reference,settings['cfg'].mod)
+                    session=Reception(packet.meta,reference,settings['cfg'].mod,run_settings)
+                    last_snapshot=-float('inf')
+                    if packet.meta.seq != 0:
+                        emit('log',f'Первый принятый заголовок: №{packet.meta.seq}. '
+                             'Пакет №0 не принят; учитываю его потерю и продолжаю эту передачу.')
                     suffix='' if session.reference_ok else ' — BER и SNR недоступны'
                     emit('log',f'Передача {packet.meta.transfer:016x}; пакетов: {packet.meta.total}; '+
                          session.reference_status+suffix)
                 was_end=session.ended
                 session.accept(packet)
                 session.transport_drops=dropped[0]
-                emit('snapshot',session.snapshot())
+                snapshot_dirty=True
                 if session.ended and not was_end:
                     emit('log','Получен END. Передача принята; RX останавливается.')
                     stop.set()
                     break
             now=time.monotonic()
+            if session and snapshot_dirty and not stop.is_set() and now-last_snapshot>=RX_SNAPSHOT_INTERVAL:
+                emit('snapshot',session.snapshot())
+                snapshot_dirty=False
+                last_snapshot=now
             if now-last>.5:
-                if session:
-                    session.transport_drops=dropped[0]
-                    emit('snapshot',session.snapshot())
                 emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
                     queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
                     squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs))
                 last=now
+    except Exception as error:
+        failure=str(error)
+        raise
     finally:
         capture_stop.set()
         if capture:
             capture.join(timeout=3)
+        if capture is not None and capture.is_alive() and failure is None:
+            failure='Драйвер RX не завершился за 3 с. Закройте приложение перед повторным запуском.'
         if sdr is not None and (capture is None or not capture.is_alive()):
             sdr.rx_destroy_buffer()
         if session:
             session.transport_drops=dropped[0]
             emit('snapshot',session.snapshot(True))
+            results.append(session.stats(True))
             emit('log','Результат: '+session.save(folder,True))
+        summary=run_path(folder,'rx','.json')
+        report=dict(started_utc=run_started,finished_utc=utc_now(),
+            elapsed_seconds=time.monotonic()-run_clock,receiver_settings=run_settings,
+            status='failed' if failure else 'finished' if results else 'no_valid_header',
+            error=failure,transfers=results,per=results[-1]['per'] if results else None,
+            ber=results[-1]['ber'] if results else None,transport_dropped_buffers=dropped[0],
+            squelched_buffers=squelched[0],captured_samples=captured_samples[0],
+            clipped_samples=clipped_samples[0],
+            clipping_fraction=clipped_samples[0]/captured_samples[0] if captured_samples[0] else None,
+            candidates=decoder.candidates,header_failures=decoder.header_failures)
+        summary.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+        emit('log','Журнал запуска RX: '+str(summary))
+        if not results and failure is None:
+            emit('log','Валидных заголовков нет: ID передачи и PER неизвестны. Сопоставьте запуск с журналом TX.')
         if capture is not None and capture.is_alive():
             raise RuntimeError('Драйвер RX не завершился за 3 с. Закройте приложение перед повторным запуском.')

@@ -10,7 +10,7 @@ from tkinter import messagebox, ttk
 import numpy as np
 
 
-ADC_FULL_SCALE = 2048.0  # AD936x signed 12-bit converter values returned by libiio.
+from radio import ADC_FULL_SCALE, clipping_fraction
 
 
 def calculate_spectrum(iq, sample_rate, center_frequency, full_scale=ADC_FULL_SCALE):
@@ -153,7 +153,7 @@ class SpectrumDebugger(tk.Tk):
                 frequency,power=calculate_spectrum(raw,actual_rate,actual_center)
                 average=power if average is None else average+(power-average)/count
                 db=10*np.log10(np.maximum(average,1e-20))
-                clipping=float(np.mean((abs(raw.real)>=2040)|(abs(raw.imag)>=2040)))
+                clipping=clipping_fraction(raw)
                 with self.latest_lock:
                     self.latest=(frequency,db,actual_center,actual_rate,clipping)
         except Exception:

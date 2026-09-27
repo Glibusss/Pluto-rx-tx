@@ -5,8 +5,10 @@ import math
 import struct
 import zlib
 from dataclasses import dataclass
+from functools import lru_cache
 import numpy as np
-from scipy.signal import correlate, find_peaks
+from scipy.fft import fft, ifft, next_fast_len
+from scipy.signal import find_peaks
 from scipy.optimize import minimize_scalar
 
 MODS = ('ASK / OOK', '2-FSK', 'BPSK', 'QPSK', '8-PSK', 'QAM-4', 'QAM-16', 'QAM-64')
@@ -43,7 +45,14 @@ def whiten(data, seed):
     return (np.frombuffer(data, np.uint8) ^ whitening(len(data), seed)).tobytes()
 
 
+@lru_cache(maxsize=len(MODS))
 def constellation(mod):
+    pts, k = _constellation(mod)
+    pts.setflags(write=False)
+    return pts, k
+
+
+def _constellation(mod):
     if mod == 'ASK / OOK':
         return np.array([0, np.sqrt(2)], complex), 1
     if mod == 'BPSK':
@@ -85,10 +94,49 @@ def decisions(z, mod):
     return ((labels[:, None] >> np.arange(k-1, -1, -1)) & 1).astype(np.uint8).ravel()
 
 
+def decision_error_energies(z, mod):
+    """Return decision-vector signal and error energies for an EVM-based SIR."""
+    z = np.asarray(z)
+    if not len(z):
+        return 0., 0.
+    if mod == '2-FSK':
+        choose_one = abs(z[:, 1]) > abs(z[:, 0])
+        decided = np.column_stack((~choose_one, choose_one)).astype(complex)
+    else:
+        pts, _ = constellation(mod)
+        labels = np.argmin(abs(z[:, None] - pts[None, :])**2, axis=1)
+        decided = pts[labels]
+    error = z - decided
+    return float(np.sum(abs(decided)**2)), float(np.sum(abs(error)**2))
+
+
 def to_wave(z, fsk=False):
     if fsk:
         return np.exp(2j*np.pi*np.asarray(z)[:, None]*np.arange(SPS)/SPS).ravel().astype(np.complex64)
     return np.repeat(z, SPS).astype(np.complex64)
+
+
+@lru_cache(maxsize=2)
+def pilot_wave(fsk=False):
+    known = to_wave(PILOTS.real if fsk else PILOTS, fsk)
+    known.setflags(write=False)
+    return known
+
+
+@lru_cache(maxsize=1)
+def channel_estimator():
+    """The pilot-only regularized LS operator is independent of received IQ."""
+    known = pilot_wave()
+    taps = 9
+    indices = np.arange(taps-1, len(known))[:, None] - np.arange(taps)
+    x = known[indices]
+    operator = np.linalg.solve(x.conj().T@x + 0.05*np.eye(taps), x.conj().T)
+    x.setflags(write=False)
+    operator.setflags(write=False)
+    return x, operator, taps
+
+
+FSK_TONE = np.exp(2j*np.pi*np.arange(SPS)/SPS)
 
 
 def block_len(cp):
@@ -200,11 +248,14 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
     FSK uses two noncoherent correlators (no channel inverse).
     """
     length = block_len(cfg.cp)
+    known = pilot_wave(fsk)
+    known_energy = np.vdot(known, known)
+    if equalize and cfg.cp and not fsk:
+        x, operator, taps = channel_estimator()
     out = []
     for block in wave[:count*length].reshape(count, length):
         if cfg.cp:
             block = block[CP_SYMBOLS*SPS:]
-        known = to_wave(PILOTS.real if fsk else PILOTS, fsk)
         pilot_rx = block[:len(known)]
         # Estimate residual frequency on known pilot waveforms, in sample domain.
         despread = pilot_rx * known.conj()
@@ -214,15 +265,12 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
         # Fixed CFO was acquired on header; suppress noisy estimates for each short block.
         slope = float(np.clip(slope, -0.01, 0.01))
         block = block * np.exp(-1j*(slope*np.arange(len(block))+intercept))
-        gain = np.vdot(known, block[:len(known)]) / np.vdot(known, known)
+        gain = np.vdot(known, block[:len(known)]) / known_energy
         if abs(gain) < 1e-9:
             gain = 1e-9
         if equalize and cfg.cp and not fsk:
-            taps = 9
-            # Rows contain x[n], x[n-1], ...; all are known pilots.
-            x = np.array([known[n-np.arange(taps)] for n in range(taps-1, len(known))])
             y = block[taps-1:len(known)]
-            hh = np.linalg.solve(x.conj().T@x + 0.05*np.eye(taps), x.conj().T@y)
+            hh = operator@y
             err = np.mean(abs(y-x@hh)**2)
             hf = np.fft.fft(hh, len(block))
             floor = max(float(err), float(abs(gain)**2)*1e-4)
@@ -231,8 +279,7 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
             block = block / gain
         rows = block[len(known):].reshape(DATA_SYMBOLS, SPS)
         if fsk:
-            tone = np.exp(2j*np.pi*np.arange(SPS)/SPS)
-            r0, r1 = rows@tone / SPS, rows@tone.conj() / SPS
+            r0, r1 = rows@FSK_TONE / SPS, rows@FSK_TONE.conj() / SPS
             out.append(np.column_stack((r0, r1)))
         else:
             # All samples after SC-FDE; skip symbol edges otherwise to reduce ISI.
@@ -248,6 +295,9 @@ class Decoded:
     observations: np.ndarray
     cfo: float
     score: float
+    sir_signal_energy: float = 0.
+    sir_interference_energy: float = 0.
+    sir_vector_count: int = 0
 
 
 def decode_frame(wave, cfg, cfo, score=1.):
@@ -272,7 +322,10 @@ def decode_frame(wave, cfg, cfo, score=1.):
     data = whiten(pack(b[:(PAYLOAD+4)*8]), payload_seed(meta))
     payload = data[:meta.length]
     valid = zlib.crc32(payload) == int.from_bytes(data[PAYLOAD:PAYLOAD+4], 'big')
-    return Decoded(meta, payload, valid, obs, cfo, score)
+    measured = meta.length*8//k  # Exclude CRC, padding, and a mixed partial symbol.
+    sir_signal, sir_interference = decision_error_energies(obs[:measured], cfg.mod)
+    return Decoded(meta, payload, valid, obs, cfo, score,
+                   sir_signal, sir_interference, measured)
 
 
 class StreamDecoder:
@@ -288,6 +341,29 @@ class StreamDecoder:
         self.candidates = 0
         self.lock_cfo = None
         self.scanned = 0
+        self.short = self.sync[:32*SPS]
+        self.step = cfg.sample_rate / len(self.short) / 2
+        self.grid = np.arange(-math.ceil(cfg.cfo_range/self.step),
+                              math.ceil(cfg.cfo_range/self.step)+1)*self.step
+        self._grid_freqs = frozenset(self.grid)
+        self._template_ffts = {}
+        self._fft_size = None
+        self._short_time = np.arange(len(self.short))/cfg.sample_rate
+        self._sync_time = np.arange(len(self.sync))/cfg.sample_rate
+
+    def _template_fft(self, freq, size):
+        # Cache only the fixed search grid at one FFT size. Locked CFOs may
+        # change every packet and must not grow the cache without a bound.
+        if size != self._fft_size:
+            self._template_ffts.clear()
+            self._fft_size = size
+        cached = self._template_ffts.get(freq)
+        if cached is None:
+            template = self.short*np.exp(2j*np.pi*freq*self._short_time)
+            cached = fft(template.conj()[::-1], size)
+            if freq in self._grid_freqs:
+                self._template_ffts[freq] = cached
+        return cached
 
     def reset(self):
         self.buffer = np.empty(0, np.complex64)
@@ -296,8 +372,7 @@ class StreamDecoder:
     def feed(self, iq, stop=None):
         self.buffer = np.r_[self.buffer, np.asarray(iq, np.complex64)]
         result = []
-        short = self.sync[:32*SPS]
-        step = self.cfg.sample_rate / len(short) / 2
+        short, step = self.short, self.step
         while len(self.buffer) >= self.length:
             if stop is not None and stop.is_set():
                 break
@@ -308,16 +383,22 @@ class StreamDecoder:
             denom = np.maximum(energy*len(short), 1e-15)
             # FFT roundoff over exact silence must not win normalized correlation.
             energetic = energy > max(float(energy.max())*1e-6, 1e-15)
-            grid = np.arange(-math.ceil(self.cfg.cfo_range/step), math.ceil(self.cfg.cfo_range/step)+1)*step
+            if not np.any(energetic):
+                # Every score would be zero under the existing energy mask.
+                self.buffer = self.buffer[positions:]
+                continue
+            grid = self.grid
             if self.lock_cfo is not None:
                 grid = np.r_[self.lock_cfo, self.lock_cfo-step, self.lock_cfo+step, grid]
             best = np.zeros(positions)
             freqs = np.zeros(positions)
+            fft_size = next_fast_len(len(segment)+len(short)-1)
+            segment_fft = fft(segment, fft_size)
             for freq in grid:
                 if stop is not None and stop.is_set():
                     break
-                template = short*np.exp(2j*np.pi*freq*np.arange(len(short))/self.cfg.sample_rate)
-                corr = correlate(segment, template, mode='valid', method='fft')
+                corr = ifft(segment_fft*self._template_fft(freq, fft_size))[
+                    len(short)-1:len(short)-1+positions]
                 score = np.where(energetic, abs(corr)**2/denom, 0)
                 improve = score > best
                 best[improve], freqs[improve] = score[improve], freq
@@ -334,7 +415,7 @@ class StreamDecoder:
                 self.candidates += 1
                 fragment = self.buffer[pos:pos+self.length]
                 base = freqs[pos]
-                t = np.arange(len(self.sync))/self.cfg.sample_rate
+                t = self._sync_time
                 objective = lambda f: -abs(np.vdot(self.sync*np.exp(2j*np.pi*f*t), fragment[:len(self.sync)]))**2
                 fine = minimize_scalar(objective, bounds=(base-step, base+step), method='bounded').x
                 # First maximum can be displaced by one sample after analog filtering.

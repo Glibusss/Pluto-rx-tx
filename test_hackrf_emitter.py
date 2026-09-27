@@ -1,9 +1,12 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
 import signal
 import subprocess
+import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -12,7 +15,8 @@ from hackrf_emitter import (EmitterConfig, build_command, build_cycle,
                             frequency_track,
                             discover_hackrf_devices, find_hackrf_info,
                             find_hackrf_transfer, load_iq_file, parse_hackrf_info,
-                            select_filter_bandwidth, stop_hackrf_process)
+                            run_transmitter, select_filter_bandwidth,
+                            stop_hackrf_process, wait_for_hackrf_ready)
 
 
 class HackRFEmitterTests(unittest.TestCase):
@@ -178,6 +182,119 @@ class HackRFEmitterTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, 'кодом 1'):
                 discover_hackrf_devices(str(transfer), runner=runner)
+
+    def test_waits_until_selected_hackrf_is_released(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+            results = iter([
+                SimpleNamespace(returncode=1,
+                                stdout='hackrf_open() failed: Access denied\n'),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout='Found HackRF\nSerial number: ABCDEF0123456789\n'),
+            ])
+            sleeps = []
+
+            ready, output = wait_for_hackrf_ready(
+                str(transfer), 'abcdef0123456789', attempts=2, interval=0.1,
+                runner=lambda _command, **_kwargs: next(results),
+                sleeper=sleeps.append)
+
+            self.assertTrue(ready)
+            self.assertIn('ABCDEF0123456789', output)
+            self.assertEqual(sleeps, [0.1])
+
+    def test_selected_hackrf_does_not_match_another_available_board(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transfer = Path(folder) / 'hackrf_transfer.exe'
+            info = Path(folder) / 'hackrf_info.exe'
+            transfer.write_bytes(b'fake')
+            info.write_bytes(b'fake')
+
+            def runner(_command, **_kwargs):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='Found HackRF\nSerial number: OTHER\n')
+
+            ready, diagnostic = wait_for_hackrf_ready(
+                str(transfer), 'WANTED', attempts=1, runner=runner)
+
+            self.assertFalse(ready)
+            self.assertIn('OTHER', diagnostic)
+
+    def test_transmitter_does_not_start_while_hackrf_is_busy(self):
+        cfg = EmitterConfig(executable='hackrf_transfer.exe')
+        events = []
+        with (patch('hackrf_emitter.resolve_executable',
+                    return_value='hackrf_transfer.exe'),
+              patch('hackrf_emitter.wait_for_hackrf_ready',
+                    return_value=(False, 'Access denied')),
+              patch('hackrf_emitter.subprocess.Popen') as popen):
+            with self.assertRaisesRegex(RuntimeError, 'Access denied'):
+                run_transmitter(cfg, threading.Event(),
+                                lambda *event: events.append(event))
+
+        popen.assert_not_called()
+        self.assertEqual(events[0], ('status', 'Ожидание готовности HackRF…'))
+
+    def test_transmitter_retries_transient_start_code_one(self):
+        stop = threading.Event()
+        events = []
+
+        class ImmediateFailure:
+            returncode = 1
+            stdout = io.StringIO('hackrf_open() failed: Access denied\n')
+
+            def poll(self):
+                return self.returncode
+
+        class RunningProcess:
+            stdout = io.StringIO('')
+
+            def __init__(self):
+                self.returncode = None
+                self.polls = 0
+
+            def poll(self):
+                if self.returncode is not None:
+                    return self.returncode
+                self.polls += 1
+                if self.polls >= 4:
+                    stop.set()
+                return None
+
+            def send_signal(self, _value):
+                self.returncode = 0
+
+            def wait(self, timeout):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+        processes = [ImmediateFailure(), RunningProcess()]
+        cfg = EmitterConfig(executable='hackrf_transfer.exe')
+        with (patch('hackrf_emitter.resolve_executable',
+                    return_value='hackrf_transfer.exe'),
+              patch('hackrf_emitter.wait_for_hackrf_ready',
+                    side_effect=[(True, 'ready'), (True, 'ready')]) as ready,
+              patch('hackrf_emitter.build_cycle',
+                    return_value=np.array([0j], np.complex64)),
+              patch('hackrf_emitter.STARTUP_STABILITY_SECONDS', 0),
+              patch('hackrf_emitter.START_RETRY_DELAYS', (0,)),
+              patch('hackrf_emitter.subprocess.Popen',
+                    side_effect=processes) as popen):
+            run_transmitter(cfg, stop, lambda *event: events.append(event))
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(ready.call_count, 2)
+        self.assertTrue(any('повтор через' in value for kind, value in events
+                            if kind == 'log'))
+        self.assertIn(('log', 'HackRF освобождён и готов к повторному запуску.'),
+                      events)
 
     def test_temp_cleanup_retries_a_windows_style_file_lock(self):
         attempts = []

@@ -40,6 +40,8 @@ TUNING_MODES = ('fixed', 'sweep')
 OPERATION_MODES = ('continuous', 'pulse')
 MAX_CYCLE_BYTES = 8 * 1024 * 1024
 PACKET_RATE = 2_000_000
+STARTUP_STABILITY_SECONDS = 0.5
+START_RETRY_DELAYS = (0.4, 0.8)
 
 
 def _tool_filename(name: str) -> str:
@@ -149,6 +151,51 @@ def discover_hackrf_devices(transfer_path: str = '', runner=subprocess.run) -> t
         raise RuntimeError('hackrf_info завершился с кодом '
                            f'{result.returncode}' + (f':\n{details}' if details else ''))
     return info_path, serials, output
+
+
+def wait_for_hackrf_ready(transfer_path: str = '', serial: str = '', *,
+                          attempts: int = 20, interval: float = 0.25,
+                          runner=subprocess.run, sleeper=time.sleep,
+                          cancel: threading.Event | None = None) -> tuple[bool, str]:
+    """Wait until ``hackrf_info`` can open the requested device.
+
+    On Windows the ``hackrf_transfer`` process can exit slightly before the
+    USB backend makes the board available to a new process. Probing with
+    ``hackrf_info`` closes that race without guessing a fixed delay.
+    """
+    if attempts < 1:
+        raise ValueError('Число попыток проверки HackRF должно быть положительным')
+    if interval < 0:
+        raise ValueError('Интервал проверки HackRF не может быть отрицательным')
+    if not find_hackrf_info(transfer_path):
+        return False, 'hackrf_info не найден рядом с hackrf_transfer'
+
+    wanted = serial.strip().casefold()
+    last_diagnostic = 'HackRF не обнаружен'
+    for attempt in range(attempts):
+        if cancel is not None and cancel.is_set():
+            return False, 'Остановка запрошена'
+        try:
+            _info_path, serials, output = discover_hackrf_devices(
+                transfer_path, runner=runner)
+            available = {value.casefold() for value in serials}
+            if (wanted in available) if wanted else bool(available):
+                return True, output
+            if wanted and serials:
+                last_diagnostic = (f'HackRF {serial.strip()} не найден; доступны: '
+                                   + ', '.join(serials))
+            else:
+                last_diagnostic = output.strip() or 'HackRF не обнаружен'
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            last_diagnostic = str(error)
+
+        if attempt + 1 < attempts:
+            if cancel is not None:
+                if cancel.wait(interval):
+                    return False, 'Остановка запрошена'
+            else:
+                sleeper(interval)
+    return False, last_diagnostic
 
 
 @dataclass(frozen=True)
@@ -437,10 +484,27 @@ def cleanup_temp_directory(folder: str | Path, emit=lambda *_: None,
     return False
 
 
+def _hackrf_failure_message(code: int, output_lines: list[str]) -> str:
+    details = '; '.join(output_lines[-3:])
+    return (f'hackrf_transfer завершился с кодом {code}'
+            + (f': {details}' if details else ''))
+
+
 def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
     """Generate a cycle, start HackRF Tools, and remain active until Stop."""
     cfg.validate()
     executable = resolve_executable(cfg.executable)
+    emit('status', 'Ожидание готовности HackRF…')
+    ready, diagnostic = wait_for_hackrf_ready(
+        executable, cfg.serial, cancel=stop)
+    if stop.is_set():
+        emit('status', 'Остановлено')
+        return
+    if not ready:
+        details = '; '.join(diagnostic.strip().splitlines()[-3:])
+        raise RuntimeError(
+            'HackRF не готов к запуску. Проверьте подключение и драйвер USB'
+            + (f': {details}' if details else '.'))
     process = None
     reader = None
     stop_attempted = False
@@ -461,19 +525,41 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
             # hackrf_transfer handles CTRL_BREAK and shuts libhackrf/file handles
             # down cleanly. A separate process group lets us target only it.
             kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-        process = subprocess.Popen(command, **kwargs)
+        output_lines: list[str] = []
+        for launch_attempt in range(len(START_RETRY_DELAYS) + 1):
+            output_lines = []
+            process = subprocess.Popen(command, **kwargs)
 
-        def read_output():
-            assert process is not None
-            if process.stdout is not None:
-                for line in process.stdout:
-                    line = line.strip()
-                    if line:
-                        emit('log', line)
+            def read_output(current_process=process, current_output=output_lines):
+                if current_process.stdout is not None:
+                    for line in current_process.stdout:
+                        line = line.strip()
+                        if line:
+                            current_output.append(line)
+                            emit('log', line)
 
-        reader = threading.Thread(target=read_output, name='hackrf_transfer output',
-                                  daemon=True)
-        reader.start()
+            reader = threading.Thread(target=read_output, name='hackrf_transfer output',
+                                      daemon=True)
+            reader.start()
+            deadline = time.monotonic() + STARTUP_STABILITY_SECONDS
+            while process.poll() is None and time.monotonic() < deadline:
+                if stop.wait(0.05):
+                    break
+            code = process.poll()
+            if code is None or stop.is_set():
+                break
+            reader.join(timeout=2)
+            if code != 1 or launch_attempt >= len(START_RETRY_DELAYS):
+                raise RuntimeError(_hackrf_failure_message(code, output_lines))
+            delay = START_RETRY_DELAYS[launch_attempt]
+            emit('log', f'hackrf_transfer вернул код 1 при запуске; '
+                 f'повтор через {delay:g} с.')
+            emit('status', 'Повторный захват HackRF…')
+            if stop.wait(delay):
+                break
+
+        if stop.is_set() and process.poll() is not None:
+            return
         emit('status', 'TX активен')
         emit('log', 'Передача запущена. Stop завершит hackrf_transfer.')
         while process.poll() is None and not stop.wait(0.1):
@@ -486,10 +572,18 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
                 raise RuntimeError(
                     'hackrf_transfer не завершился после Stop. Отключите и снова '
                     'подключите HackRF; при необходимости перезагрузите Windows.')
+            emit('status', 'Ожидание освобождения USB…')
+            ready, diagnostic = wait_for_hackrf_ready(executable, cfg.serial)
+            if ready:
+                emit('log', 'HackRF освобождён и готов к повторному запуску.')
+            else:
+                details = '; '.join(diagnostic.strip().splitlines()[-3:])
+                emit('log', 'HackRF пока не подтвердил готовность после Stop'
+                     + (f': {details}' if details else '.'))
         reader.join(timeout=2)
         code = process.returncode
         if not stop.is_set() and code:
-            raise RuntimeError(f'hackrf_transfer завершился с кодом {code}')
+            raise RuntimeError(_hackrf_failure_message(code, output_lines))
     finally:
         if process is not None and process.poll() is None and not stop_attempted:
             stop_hackrf_process(process)

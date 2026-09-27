@@ -7,6 +7,27 @@ from modem import *
 from session import Source, Reception
 
 class IntegrationTests(unittest.TestCase):
+    def test_duplicate_good_packet_does_not_replace_first_crc_failure(self):
+        source=Source.text('A'*PAYLOAD+'B'*PAYLOAD)
+        cfg=Config('QPSK',False,False)
+        first=decode_frame(make_frame(source.meta(12,0),source.payload(0),cfg),cfg,0)
+        duplicate=decode_frame(make_frame(source.meta(12,0),source.payload(0),cfg),cfg,0)
+        last=decode_frame(make_frame(source.meta(12,1),source.payload(1),cfg),cfg,0)
+        damaged=bytearray(first.payload);damaged[0]^=1
+        first.payload=bytes(damaged);first.crc_ok=False
+        reception=Reception(first.meta,source,cfg.mod)
+        for packet in (first,duplicate,last):reception.accept(packet)
+        stats=reception.stats(True)
+        self.assertEqual(stats['duplicates'],1)
+        self.assertEqual(stats['good_packets'],1)
+        self.assertEqual(stats['crc_packets'],1)
+        self.assertEqual(stats['bit_errors'],1)
+        self.assertEqual(stats['compared_bits'],PAYLOAD*16)
+        self.assertEqual(stats['ber'],1/(PAYLOAD*16))
+        self.assertEqual(stats['per'],.5)
+        self.assertEqual(stats['ber_coverage'],1)
+        self.assertEqual(bytes(reception.data),first.payload+last.payload)
+
     def test_noisy_stream_all_switches(self):
         rng=np.random.default_rng(291)
         data=rng.integers(0,256,PAYLOAD,dtype=np.uint8).tobytes()
@@ -102,6 +123,17 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('SHA-256',reception.stats()['reference_status'])
         no_reference=Reception(first.meta(9,0),None,'BPSK')
         self.assertEqual(no_reference.stats()['reference_status'],'эталон не выбран')
+
+    def test_sir_is_available_without_reference(self):
+        source=Source.text('SIR без эталона')
+        cfg=Config('QPSK',False,False)
+        packet=decode_frame(make_frame(source.meta(10,0),source.payload(0),cfg),cfg,0)
+        reception=Reception(packet.meta,None,cfg.mod)
+        reception.accept(packet)
+        stats=reception.stats()
+        self.assertIsNone(stats['snr_estimate_db'])
+        self.assertIsNotNone(stats['sir_estimate_db'])
+        self.assertGreater(stats['sir_estimate_db'],20)
 
     def test_noise_does_not_create_packets(self):
         rng=np.random.default_rng(992)

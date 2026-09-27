@@ -57,8 +57,9 @@ class Source:
 
 
 class Reception:
-    def __init__(self, meta, reference, mod):
+    def __init__(self, meta, reference, mod, settings=None):
         self.meta, self.mod = meta, mod
+        self.settings = dict(settings or {})
         self.reference = reference
         if reference is None:
             self.reference_status='эталон не выбран'
@@ -74,16 +75,23 @@ class Reception:
         else:
             self.reference_status='эталон совпадает'
         self.reference_ok=self.reference_status=='эталон совпадает'
-        self.data = bytearray([128]*meta.size) if meta.kind else bytearray(meta.size)
+        self.data = bytearray(b'\x80')*meta.size if meta.kind else bytearray(meta.size)
         self.rows = {}
+        self.good_packets = 0
+        self.compared_bits = 0
+        self.bit_errors = 0
         self.ended = False
         self.duplicates = 0
         self.signal_sum = self.error_sum = 0.
         self.symbol_count = 0
+        self.sir_signal_sum = self.sir_interference_sum = 0.
+        self.sir_vector_count = 0
         self.decision_samples = np.empty((0,2))
         self.cfo = 0.
         self.transport_drops = 0
         self.preview_size = 0
+        self.first_sequence = meta.seq
+        self.first_header_was_end = meta.end
 
     def accept(self, packet):
         m = packet.meta
@@ -97,6 +105,9 @@ class Reception:
         if m.seq in self.rows:
             self.duplicates += 1
             return  # First observation wins: no concealed BER improvement by retransmissions.
+        self.sir_signal_sum += packet.sir_signal_energy
+        self.sir_interference_sum += packet.sir_interference_energy
+        self.sir_vector_count += packet.sir_vector_count
         errors = None
         nbits = m.length*8
         if self.reference_ok:
@@ -118,6 +129,10 @@ class Reception:
             self.symbol_count += n
         self.rows[m.seq] = dict(seq=m.seq,status='GOOD' if packet.crc_ok else 'CRC',
                                bit_errors=errors,payload_bits=nbits,cfo_hz=packet.cfo)
+        self.good_packets += int(packet.crc_ok)
+        if errors is not None:
+            self.compared_bits += nbits
+            self.bit_errors += errors
         self.cfo = packet.cfo
         if self.mod == '2-FSK':
             self.decision_samples = abs(packet.observations[:600])
@@ -136,12 +151,14 @@ class Reception:
             self.preview_size = max(self.preview_size,start+m.length)
 
     def stats(self, final=False):
-        good = sum(r['status']=='GOOD' for r in self.rows.values())
+        good = self.good_packets
         received = len(self.rows)
-        compared = sum(r['payload_bits'] for r in self.rows.values()) if self.reference_ok else 0
-        errors = sum(r['bit_errors'] for r in self.rows.values()) if self.reference_ok else None
+        compared = self.compared_bits
+        errors = self.bit_errors if self.reference_ok else None
         expected_bits = self.meta.total*PAYLOAD*8 if self.meta.kind else self.meta.size*8
         snr = 10*math.log10(self.signal_sum/max(self.error_sum,1e-30)) if self.symbol_count else None
+        sir = (10*math.log10(self.sir_signal_sum/max(self.sir_interference_sum,1e-30))
+               if self.sir_vector_count and self.sir_signal_sum > 0 else None)
         return dict(transfer=f'{self.meta.transfer:016x}',modulation=self.mod,
             kind='RGB' if self.meta.kind else 'text',width=self.meta.width,height=self.meta.height,
             expected_packets=self.meta.total,received_packets=received,good_packets=good,
@@ -151,8 +168,13 @@ class Reception:
             expected_bits=expected_bits,ber_coverage=compared/expected_bits,
             reference_match=self.reference_ok,reference_status=self.reference_status,snr_estimate_db=snr,
             snr_method='reference error at symbol decisions; includes residual channel distortion',
+            sir_estimate_db=sir,
+            sir_method='decision-directed error vectors at payload symbol decisions; dB',
             end_seen=self.ended,duplicates=self.duplicates,last_cfo_hz=self.cfo,
-            transport_dropped_buffers=self.transport_drops)
+            transport_dropped_buffers=self.transport_drops,
+            first_received_sequence=self.first_sequence,
+            first_header_was_end=self.first_header_was_end,
+            receiver_settings=self.settings)
 
     def snapshot(self, final=False):
         return dict(stats=self.stats(final),data=bytes(self.data),

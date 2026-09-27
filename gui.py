@@ -89,6 +89,8 @@ class App(tk.Tk):
         self.received_decoder=None
         self.received_final=False
         self.received_limited=False
+        self.environment_dbfs=None
+        self.receiver_noise_dbfs=None
         self.protocol('WM_DELETE_WINDOW',self.close)
         self.build()
         self.after(100,self.poll)
@@ -110,6 +112,8 @@ class App(tk.Tk):
         self.queue_buffers=tk.StringVar(value=str(RX_QUEUE_DEFAULT))
         self.squelch=tk.BooleanVar(value=False)
         self.squelch_threshold=tk.StringVar(value='')
+        self.environment_level=tk.StringVar(value='Фон и помехи: —')
+        self.receiver_noise_level=tk.StringVar(value='Шум приёмника: —')
         self.pre=tk.BooleanVar(value=True)
         self.cp=tk.BooleanVar(value=False)
         entries=[('URI Pluto',self.uri,24),('Частота центра, МГц',self.freq,13),
@@ -164,17 +168,26 @@ class App(tk.Tk):
         if not self.tx:
             squelch=ttk.Frame(rf)
             squelch.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
-            w=ttk.Checkbutton(squelch,text='Отсекать шум',variable=self.squelch)
+            environment=ttk.Frame(squelch)
+            environment.pack(anchor='w')
+            w=ttk.Checkbutton(environment,text='Отсекать фон',variable=self.squelch)
             w.pack(side='left',padx=5)
             self.controls.append((w,'normal'))
-            ttk.Label(squelch,text='Порог, dBFS:').pack(side='left',padx=(8,4))
-            w=ttk.Entry(squelch,textvariable=self.squelch_threshold,width=9)
+            ttk.Label(environment,text='Порог, dBFS:').pack(side='left',padx=(8,4))
+            w=ttk.Entry(environment,textvariable=self.squelch_threshold,width=9)
             w.pack(side='left')
             self.controls.append((w,'normal'))
-            w=ttk.Button(squelch,text='Калибровка шума',command=self.calibrate)
+            w=ttk.Button(environment,text='Калибровка помеховой обстановки',command=self.calibrate_environment)
             w.pack(side='left',padx=8)
             self.controls.append((w,'normal'))
-            ttk.Label(squelch,text='Перед калибровкой выключите TX').pack(side='left',padx=4)
+            ttk.Label(environment,textvariable=self.environment_level).pack(side='left',padx=4)
+            noise=ttk.Frame(squelch)
+            noise.pack(anchor='w',pady=(5,0))
+            w=ttk.Button(noise,text='Калибровка шума приёмника',command=self.calibrate_receiver_noise)
+            w.pack(side='left',padx=5)
+            self.controls.append((w,'normal'))
+            ttk.Label(noise,text='Требуется согласованная заглушка 50 Ω на RX').pack(side='left',padx=(8,4))
+            ttk.Label(noise,textvariable=self.receiver_noise_level).pack(side='left',padx=8)
         src=ttk.LabelFrame(main,text='Данные для передачи' if self.tx else 'Эталон — тот же файл или точно тот же текст, что на TX',padding=8)
         src.pack(fill='both',expand=True,pady=8)
         self.kind=tk.StringVar(value='image')
@@ -215,17 +228,16 @@ class App(tk.Tk):
         self.status=ttk.Label(run,text='Остановлено')
         self.status.pack(side='left',padx=8)
         self.folder=tk.StringVar(value=str(Path.cwd()/'received'))
-        if not self.tx:
-            dst=ttk.Frame(main)
-            dst.pack(fill='x',pady=(8,0))
-            ttk.Label(dst,text='Сохранение результатов:').pack(side='left')
-            w=ttk.Entry(dst,textvariable=self.folder)
-            w.pack(side='left',fill='x',expand=True,padx=8)
-            self.controls.append((w,'normal'))
-            w=ttk.Button(dst,text='Папка…',command=self.pick_folder)
-            w.pack(side='left')
-            self.controls.append((w,'normal'))
-        self.metrics=ttk.Label(main,text='BER: —    PER: —    SNR: —',font=('Segoe UI',11),wraplength=1140)
+        dst=ttk.Frame(main)
+        dst.pack(fill='x',pady=(8,0))
+        ttk.Label(dst,text='Журнал передач:' if self.tx else 'Сохранение результатов:').pack(side='left')
+        w=ttk.Entry(dst,textvariable=self.folder)
+        w.pack(side='left',fill='x',expand=True,padx=8)
+        self.controls.append((w,'normal'))
+        w=ttk.Button(dst,text='Папка…',command=self.pick_folder)
+        w.pack(side='left')
+        self.controls.append((w,'normal'))
+        self.metrics=ttk.Label(main,text='BER: —    PER: —    SNR: —    SIR: —',font=('Segoe UI',11),wraplength=1140)
         self.metrics.pack(fill='x',pady=8)
         self.tabs=ttk.Notebook(main)
         self.tabs.pack(fill='both',expand=True)
@@ -340,15 +352,30 @@ class App(tk.Tk):
         squelch_dbfs=None
         if not self.tx and include_squelch and self.squelch.get():
             if not self.squelch_threshold.get().strip():
-                raise ValueError('Сначала выполните калибровку шума или введите порог dBFS')
+                raise ValueError('Сначала выполните калибровку помеховой обстановки или введите порог dBFS')
             squelch_dbfs=float(self.squelch_threshold.get().replace(',','.'))
             if not -150<=squelch_dbfs<=10:
-                raise ValueError('Шумовой порог: -150…10 dBFS')
+                raise ValueError('Порог фона: -150…10 dBFS')
         if not self.uri.get().strip():raise ValueError('Введите URI Pluto')
         return dict(cfg=cfg,frequency=freq,gain=gain,gap_ms=gap,uri=self.uri.get().strip(),
-                    queue_buffers=queue_buffers,squelch_dbfs=squelch_dbfs)
+                    queue_buffers=queue_buffers,squelch_dbfs=squelch_dbfs,
+                    environment_dbfs=self.environment_dbfs,
+                    receiver_noise_dbfs=self.receiver_noise_dbfs,
+                    results_folder=self.folder.get())
 
-    def calibrate(self):
+    def calibrate_environment(self):
+        self._start_calibration('environment')
+
+    def calibrate_receiver_noise(self):
+        if self.tx or self.worker and self.worker.is_alive():return
+        confirmed=messagebox.askokcancel(
+            'Калибровка шума приёмника',
+            'Отключите антенну и подключите к RX-входу Pluto согласованную заглушку 50 Ω.\n\n'
+            'Не используйте короткое замыкание или незаглушенный вход. Продолжить?')
+        if confirmed:
+            self._start_calibration('receiver_noise')
+
+    def _start_calibration(self,kind):
         if self.tx or self.worker and self.worker.is_alive():return
         try:
             settings=self.settings(include_squelch=False)
@@ -358,16 +385,22 @@ class App(tk.Tk):
         for widget,state in self.controls:widget.configure(state='disabled')
         self.start_btn.configure(state='disabled')
         self.stop_btn.configure(state='normal')
-        self.status.configure(text='Калибровка шума…')
-        self.write_log('Калибровка шума: TX должен быть выключен. Измерение около 2 секунд.')
+        receiver_noise=kind=='receiver_noise'
+        title='Калибровка шума приёмника' if receiver_noise else 'Калибровка помеховой обстановки'
+        self.status.configure(text=title+'…')
+        if receiver_noise:
+            self.write_log(title+': измерение с согласованной заглушкой 50 Ω, около 2 секунд.')
+        else:
+            self.write_log(title+': наш TX должен быть выключен, антенна остаётся подключённой. '
+                           'Измерение около 2 секунд.')
         def work():
             try:
                 result=calibrate_noise(settings,self.stop_event)
-                if result is not None:self.emit('calibration',result)
+                if result is not None:self.emit('calibration',(kind,result))
             except Exception:
                 self.emit('error',traceback.format_exc())
             finally:self.emit('done',None)
-        self.worker=threading.Thread(target=work,name='Pluto noise calibration',daemon=True)
+        self.worker=threading.Thread(target=work,name='Pluto '+kind+' calibration',daemon=True)
         self.worker.start()
 
     def start(self):
@@ -393,7 +426,9 @@ class App(tk.Tk):
         rs=cfg.sample_rate/8
         self.write_log(f'{cfg.mod}; Rs={rs:g} симв/с; preamble={cfg.preamble}; CP={cfg.cp}.')
         if not self.tx and settings['squelch_dbfs'] is not None:
-            self.write_log(f'Отсечение шума включено; порог {settings["squelch_dbfs"]:.1f} dBFS.')
+            self.write_log(f'Отсечение фона включено; порог {settings["squelch_dbfs"]:.1f} dBFS.')
+        if not self.tx:
+            self.write_log('Для измерений запускайте RX до TX. Потеря №0 не прерывает приём №1 и следующих пакетов.')
         if self.tx:
             duration=(frame_len(cfg)+(len(PREAMBLE) if cfg.preamble else 0))/cfg.sample_rate
             self.write_log(f'Радиопакет ≈{duration*1000:.1f} мс. Одинаковая Rs и средняя энергия символа; не одинаковая Eb/N0.')
@@ -453,15 +488,24 @@ class App(tk.Tk):
                 self.write_log(value)
                 if kind=='error':self.tabs.select(self.log)
             elif kind=='calibration':
-                # CFAR margins can be fractions of a decibel; keep enough precision
-                # when transferring the calibrated threshold into the editable field.
-                self.squelch_threshold.set(f'{value["threshold_dbfs"]:.2f}')
-                self.squelch.set(True)
-                self.write_log(f'Калибровка завершена: шум {value["noise_dbfs"]:.1f} dBFS, '+
-                    f'σ мощности {value["spread_db"]:.2f} dB, порог {value["threshold_dbfs"]:.1f} dBFS '+
-                    f'(P_FA≤{value["false_alarm_probability"]:.0e}), '
-                    f'буферов {value["used_buffers"]}/{value["buffers"]}, '
-                    f'выбросов {value["outliers"]}.')
+                calibration,result=value
+                details=(f'σ мощности {result["spread_db"]:.2f} dB, '
+                    f'буферов {result["used_buffers"]}/{result["buffers"]}, '
+                    f'выбросов {result["outliers"]}.')
+                if calibration=='environment':
+                    self.environment_dbfs=result['noise_dbfs']
+                    self.environment_level.set(f'Фон и помехи: {self.environment_dbfs:.1f} dBFS')
+                    # CFAR margins can be fractions of a decibel; keep enough precision
+                    # when transferring the calibrated threshold into the editable field.
+                    self.squelch_threshold.set(f'{result["threshold_dbfs"]:.2f}')
+                    self.squelch.set(True)
+                    self.write_log(f'Помеховая обстановка: {self.environment_dbfs:.1f} dBFS, '
+                        f'порог {result["threshold_dbfs"]:.1f} dBFS '
+                        f'(P_FA≤{result["false_alarm_probability"]:.0e}), '+details)
+                else:
+                    self.receiver_noise_dbfs=result['noise_dbfs']
+                    self.receiver_noise_level.set(f'Шум приёмника: {self.receiver_noise_dbfs:.1f} dBFS')
+                    self.write_log(f'Шум приёмника с заглушкой: {self.receiver_noise_dbfs:.1f} dBFS, '+details)
             elif kind=='discovery':
                 found,initial_uri,automatic=value
                 self.discovery_worker=None
@@ -507,11 +551,12 @@ class App(tk.Tk):
         number=lambda x:'—' if x is None else f'{x:.5g}'
         self.metrics.configure(text=(f'BER: {number(s["ber"])}  (проверено {s["ber_coverage"]:.1%} бит)     '
             f'PER: {s["per"]:.4f}'+(' [итог]' if s['per_final'] else ' [предварительно]')+
-            f'     SNR-оценка: {number(s["snr_estimate_db"])} dB\n'
+            f'     SNR-оценка: {number(s["snr_estimate_db"])} dB'
+            f'     SIR-оценка: {number(s["sir_estimate_db"])} dB\n'
             f'GOOD: {s["good_packets"]}   CRC: {s["crc_packets"]}   '
             f'{"LOST" if s["per_final"] else "Ожидаются / потеряны"}: {s["missing_packets"]}   '
             f'Всего: {s["expected_packets"]}   CFO: {s["last_cfo_hz"]:.0f} Гц'+
-            ('' if s['reference_match'] else f'\nBER недоступен: {s["reference_status"]}')))
+            ('' if s['reference_match'] else f'\nBER/SNR недоступны: {s["reference_status"]}')))
         self.progress.configure(maximum=s['expected_packets'],value=s['received_packets'])
         if s['kind']=='RGB':
             self.show_image(self.right,Image.frombytes('RGB',(s['width'],s['height']),snapshot['data']),'right')
