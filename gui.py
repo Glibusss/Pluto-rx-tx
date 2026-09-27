@@ -173,7 +173,7 @@ class App(tk.Tk):
             w=ttk.Entry(amplitude,textvariable=self.tx_amplitude,width=9)
             w.pack(side='left')
             self.controls.append((w,'normal'))
-            ttk.Label(amplitude,text='1…16384; прежний уровень 4096. Фиксируйте при сравнении модуляций.').pack(side='left',padx=8)
+            ttk.Label(amplitude,text='1…16384').pack(side='left',padx=8)
         else:
             squelch=ttk.Frame(rf)
             squelch.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
