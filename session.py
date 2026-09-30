@@ -89,6 +89,8 @@ class Reception:
         self.decision_samples = np.empty((0,2))
         self.cfo = 0.
         self.transport_drops = 0
+        self.transport_read_errors = 0
+        self.transport_buffer_restarts = 0
         self.preview_size = 0
         self.first_sequence = meta.seq
         self.first_header_was_end = meta.end
@@ -172,6 +174,8 @@ class Reception:
             sir_method='decision-directed error vectors at payload symbol decisions; dB',
             end_seen=self.ended,duplicates=self.duplicates,last_cfo_hz=self.cfo,
             transport_dropped_buffers=self.transport_drops,
+            transport_read_errors=self.transport_read_errors,
+            transport_buffer_restarts=self.transport_buffer_restarts,
             first_received_sequence=self.first_sequence,
             first_header_was_end=self.first_header_was_end,
             receiver_settings=self.settings)

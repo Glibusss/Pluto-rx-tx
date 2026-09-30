@@ -6,17 +6,22 @@ import signal
 import subprocess
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock,patch
 
 import numpy as np
+from scipy.signal import resample_poly
 
 from hackrf_emitter import (EmitterConfig, build_command, build_cycle,
                             cleanup_temp_directory, complex_to_cs8, cycle_sample_count,
                             frequency_track,
+                            iter_cycle_chunks, packet_source, write_cycle, WaveformCancelled,
                             discover_hackrf_devices, find_hackrf_info,
                             find_hackrf_transfer, load_iq_file, parse_hackrf_info,
                             run_transmitter, select_filter_bandwidth,
                             stop_hackrf_process, wait_for_hackrf_ready)
+from modem import Config, MODS, PREAMBLE, frame_len, StreamDecoder
+from session import Source
+from tx_emitter import EmitterApp
 
 
 class HackRFEmitterTests(unittest.TestCase):
@@ -31,9 +36,14 @@ class HackRFEmitterTests(unittest.TestCase):
         cases = [
             EmitterConfig(frequency_hz=999_999),
             EmitterConfig(sample_rate=3_000_000),
-            EmitterConfig(bandwidth_hz=7_000_000),
+            EmitterConfig(bandwidth_hz=9_000_000),
             EmitterConfig(txvga_gain=48),
-            EmitterConfig(amplitude=0),
+            EmitterConfig(amplitude=-.001),
+            EmitterConfig(amplitude=float('inf')),
+            EmitterConfig(sweep_period_ms=0),
+            EmitterConfig(sweep_period_ms=1e308,tuning_mode='sweep'),
+            EmitterConfig(pulse_off_ms=-1),
+            EmitterConfig(packet_kind='invalid'),
             EmitterConfig(frequency_hz=1_000_000, bandwidth_hz=1_000_000),
         ]
         for cfg in cases:
@@ -77,8 +87,141 @@ class HackRFEmitterTests(unittest.TestCase):
             iq = build_cycle(cfg)
             with self.subTest(modulation=modulation):
                 self.assertEqual(iq.dtype, np.complex64)
-                self.assertEqual(len(iq), 200_000)
+                self.assertEqual(len(iq), cycle_sample_count(cfg))
+                self.assertGreaterEqual(len(iq),200_000)
+                packet_samples=len(PREAMBLE)+frame_len(Config(modulation,True,False,2000000))
+                self.assertEqual(len(iq)%packet_samples,0)
                 self.assertGreater(np.count_nonzero(iq), len(iq) // 2)
+
+    def test_packet_content_decodes_as_random_text_or_red_rgb_for_every_modulation(self):
+        for kind in ('text','image'):
+            for modulation in MODS:
+                with self.subTest(kind=kind,modulation=modulation):
+                    cfg=EmitterConfig(sample_rate=2000000,packet_kind=kind,modulation=modulation)
+                    source=packet_source(cfg)
+                    iq=build_cycle(cfg,source,63)
+                    encoded=np.frombuffer(complex_to_cs8(iq),np.int8)
+                    received=encoded[::2].astype(float)/127+1j*encoded[1::2].astype(float)/127
+                    decoder=StreamDecoder(Config(modulation,True,False,2000000,0))
+                    packets=decoder.feed(received)
+                    self.assertGreater(len(packets),1)
+                    self.assertTrue(all(p.crc_ok for p in packets))
+                    self.assertTrue(all(p.payload==source.raw for p in packets))
+                    self.assertEqual(packets[0].meta.digest,source.digest)
+                    self.assertEqual(packets[0].meta.kind,int(kind=='image'))
+                    self.assertEqual(len(decoder.buffer),0)
+                    if kind=='image':
+                        self.assertEqual((packets[0].meta.width,packets[0].meta.height),(16,16))
+                        self.assertEqual(source.raw,bytes((255,0,0))*256)
+                    else:
+                        self.assertEqual((packets[0].meta.width,packets[0].meta.height),(0,0))
+                        source.raw.decode('utf-8')
+
+    def test_resampled_hackrf_frames_decode_at_pluto_rate(self):
+        for rate in (8000000,20000000):
+            for modulation in MODS:
+                with self.subTest(rate=rate,modulation=modulation):
+                    cfg=EmitterConfig(sample_rate=rate,modulation=modulation,packet_kind='image')
+                    source=packet_source(cfg)
+                    codes=np.frombuffer(complex_to_cs8(build_cycle(cfg,source,29)),np.int8)
+                    base=codes[::2].astype(float)/127+1j*codes[1::2].astype(float)/127
+                    received=resample_poly(base,2000000,rate)
+                    decoder=StreamDecoder(Config(modulation,True,False,2000000,0))
+                    packets=decoder.feed(received)
+                    self.assertGreater(len(packets),1)
+                    self.assertTrue(all(p.crc_ok and p.payload==source.raw for p in packets))
+                    self.assertEqual(len(decoder.buffer),0)
+
+    def test_gui_binds_packet_kind_and_extended_controls(self):
+        values=dict(gain='47',frequency='2400',sample_rate='8',bandwidth='8',
+                    amplitude='200',signal_mode='packet',modulation='BPSK',packet_kind='image',
+                    tuning_mode='fixed',operation_mode='continuous',sweep_period='12000',
+                    pulse_on='20000',pulse_off='0',iq_path='',iq_format='CS8',
+                    serial='',executable='hackrf_transfer',rf_amp=True)
+        app=SimpleNamespace(_number=EmitterApp._number,
+                            **{name:Mock(get=Mock(return_value=value)) for name,value in values.items()})
+        cfg=EmitterApp.settings(app)
+        self.assertEqual(cfg.packet_kind,'image')
+        self.assertEqual(cfg.amplitude,2)
+        self.assertEqual(cfg.bandwidth_hz,cfg.sample_rate)
+        self.assertEqual(cfg.txvga_gain,47)
+        self.assertTrue(cfg.rf_amp)
+
+    def test_each_start_generates_new_random_text(self):
+        cfg=EmitterConfig(packet_kind='text')
+        with patch('hackrf_emitter.secrets.token_hex',side_effect=['a'*768,'b'*768]):
+            first,second=packet_source(cfg),packet_source(cfg)
+        self.assertNotEqual(first.raw,second.raw)
+        self.assertNotEqual(first.digest,second.digest)
+        self.assertEqual(first.total,1)
+
+    def test_extended_controls_allow_full_band_overdrive_and_long_cycles(self):
+        for cfg in (EmitterConfig(bandwidth_hz=8000000,amplitude=2),
+                    EmitterConfig(sweep_period_ms=12000,pulse_on_ms=20000,pulse_off_ms=0),
+                    EmitterConfig(amplitude=0),EmitterConfig(amplitude=.0001)):
+            with self.subTest(cfg=cfg):
+                cfg.validate()
+        cfg=EmitterConfig(bandwidth_hz=8000000)
+        self.assertGreaterEqual(select_filter_bandwidth(cfg),cfg.bandwidth_hz)
+
+    def test_overdrive_saturates_without_int8_wrap_and_zero_amplitude_is_silent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'wave.cf32'
+            np.array([1+0j,0+1j,0j,-1-1j],'<c8').tofile(path)
+            for amplitude in (0,2,1e308):
+                cfg=EmitterConfig(signal_mode='file',iq_path=str(path),iq_format='cf32',amplitude=amplitude)
+                iq=build_cycle(cfg)
+                self.assertTrue(np.all(np.isfinite(iq)))
+                values=np.frombuffer(complex_to_cs8(iq),np.int8)
+                if amplitude==0:
+                    self.assertTrue(np.all(values==0))
+                else:
+                    np.testing.assert_array_equal(values,[127,0,0,127,0,0,-127,-127])
+
+    def test_large_cycle_is_written_in_bounded_chunks_with_exact_silent_tail(self):
+        cfg=EmitterConfig(sample_rate=2000000,operation_mode='pulse',pulse_on_ms=1200,
+                          pulse_off_ms=1200,packet_kind='image')
+        chunks=iter_cycle_chunks(cfg,chunk_samples=32768,source=packet_source(cfg),transfer=64)
+        total=0
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk),32768)
+            total+=len(chunk)
+        self.assertEqual(total,4800000)
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'large.cs8'
+            samples=write_cycle(cfg,path,source=packet_source(cfg),transfer=64,chunk_samples=32768)
+            self.assertEqual(samples,4800000)
+            self.assertEqual(path.stat().st_size,9600000)
+            self.assertGreater(path.stat().st_size,8*1024**2)
+            with path.open('rb') as stream:
+                stream.seek(2400000*2)
+                while chunk:=stream.read(65536):
+                    self.assertFalse(any(chunk))
+
+    def test_noise_filter_and_sweep_are_continuous_across_chunk_boundaries(self):
+        for bandwidth in (500000,2000000):
+            cfg=EmitterConfig(sample_rate=2000000,signal_mode='noise',bandwidth_hz=bandwidth,
+                              tuning_mode='sweep',operation_mode='pulse',pulse_on_ms=20,pulse_off_ms=3)
+            small=np.concatenate(list(iter_cycle_chunks(cfg,chunk_samples=1024)))
+            large=np.concatenate(list(iter_cycle_chunks(cfg,chunk_samples=8192)))
+            np.testing.assert_allclose(small,large,atol=1e-6,rtol=1e-6)
+            self.assertTrue(np.all(small[40000:]==0))
+
+    def test_stop_during_iq_generation_does_not_launch_hackrf(self):
+        with (patch('hackrf_emitter.resolve_executable',return_value='hackrf_transfer.exe'),
+              patch('hackrf_emitter.wait_for_hackrf_ready',return_value=(True,'ready')),
+              patch('hackrf_emitter.write_cycle',side_effect=WaveformCancelled),
+              patch('hackrf_emitter.subprocess.Popen') as popen):
+            run_transmitter(EmitterConfig(),threading.Event(),lambda *event:None)
+        popen.assert_not_called()
+
+    def test_chunk_generator_honors_stop_during_reference_pass(self):
+        stop=Mock()
+        stop.is_set.side_effect=[False,False,True]
+        cfg=EmitterConfig(sample_rate=2000000,signal_mode='noise',operation_mode='pulse',
+                          pulse_on_ms=10000,pulse_off_ms=10000)
+        with self.assertRaises(WaveformCancelled):
+            list(iter_cycle_chunks(cfg,chunk_samples=1024,stop=stop))
 
     def test_loads_cs8_and_cf32_iq_files(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -281,8 +424,8 @@ class HackRFEmitterTests(unittest.TestCase):
                     return_value='hackrf_transfer.exe'),
               patch('hackrf_emitter.wait_for_hackrf_ready',
                     side_effect=[(True, 'ready'), (True, 'ready')]) as ready,
-              patch('hackrf_emitter.build_cycle',
-                    return_value=np.array([0j], np.complex64)),
+              patch('hackrf_emitter.write_cycle',side_effect=lambda _cfg,path,*args:
+                    (Path(path).write_bytes(b'\0\0') or 1)),
               patch('hackrf_emitter.STARTUP_STABILITY_SECONDS', 0),
               patch('hackrf_emitter.START_RETRY_DELAYS', (0,)),
               patch('hackrf_emitter.subprocess.Popen',

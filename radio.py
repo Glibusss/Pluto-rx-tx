@@ -3,12 +3,16 @@ from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
+import ctypes
+import errno
 import json
 import math
+import os
 import queue
 import secrets
 import threading
 import time
+import traceback
 from pathlib import Path
 import numpy as np
 from scipy.stats import f as fisher_f, norm
@@ -28,7 +32,48 @@ TX_AMPLITUDE_MAX = 16384.0
 NOISE_FALSE_ALARM = 1e-6
 NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
+RX_READ_RETRY_LIMIT = 3
+RX_READ_RETRY_DELAY = 0.2
 PROCESSING_REVISION = 'cached-ls-fft-v1'
+
+
+def read_rx_buffer(sdr):
+    """Recover errno hidden by old Windows pylibiio NULL-pointer checks.
+
+    libiio sets C errno when buffer creation fails. Some Windows bindings read
+    GetLastError instead; leave a valid error untouched and never reuse stale errno.
+    """
+    ctypes.set_errno(0)
+    try:
+        return sdr.rx()
+    except OSError as error:
+        native_errno = ctypes.get_errno()
+        if error.errno == 0 and native_errno:
+            raise OSError(native_errno,'libiio: '+os.strerror(native_errno)+
+                          '; Python bindings reported '+str(error)) from error
+        raise
+
+
+def retryable_rx_error(error):
+    return error.errno in (0,errno.EINTR,errno.EAGAIN,errno.EIO,errno.ETIMEDOUT,110,10060)
+
+
+def sdr_runtime_info():
+    """Record the executing Python and loaded bindings, without opening an SDR."""
+    import sys
+    from importlib.metadata import PackageNotFoundError, version
+    result = dict(python=sys.version,python_executable=sys.executable)
+    for package in ('pyadi-iio','pylibiio'):
+        try:
+            result[package] = version(package)
+        except PackageNotFoundError:
+            pass
+    binding = sys.modules.get('iio')
+    if binding is not None:
+        result['iio_module'] = getattr(binding,'__file__',None)
+        result['libiio_version'] = getattr(binding,'version',None)
+        result['libiio_library'] = getattr(getattr(binding,'_lib',None),'_name',None)
+    return result
 
 
 def tx_amplitude(settings):
@@ -75,6 +120,7 @@ def experiment_settings(settings, sdr=None, tx=False):
         result['queue_buffers'] = rx_queue_capacity(settings)
         result['gain_mode'] = 'manual'
         result['acquisition'] = 'first valid header; start RX before TX'
+        result['rx_read_retry_limit'] = RX_READ_RETRY_LIMIT
     if sdr is not None:
         prefix = 'tx' if tx else 'rx'
         actual = {}
@@ -83,6 +129,7 @@ def experiment_settings(settings, sdr=None, tx=False):
             if value is not None:
                 actual[name] = float(value) if 'gain' in name else int(value)
         result['actual'] = actual
+        result['runtime'] = sdr_runtime_info()
     return result
 
 
@@ -222,7 +269,7 @@ def calibrate_noise(settings, stop, duration=2.0):
         for _ in range(count):
             if stop.is_set():
                 return None
-            raw=np.asarray(sdr.rx()).ravel()
+            raw=np.asarray(read_rx_buffer(sdr)).ravel()
             if samples_per_buffer is None:
                 samples_per_buffer=len(raw)
             elif len(raw)!=samples_per_buffer:
@@ -369,12 +416,20 @@ def receive(settings, reference, folder, stop, emit):
     failure=None
     clipped_samples=[0]
     captured_samples=[0]
+    read_errors=[0]
+    buffer_restarts=[0]
+    read_error_events=[]
     last_snapshot=-float('inf')
     snapshot_dirty=False
     decoder=StreamDecoder(settings['cfg'])
     threshold_dbfs=settings.get('squelch_dbfs')
     threshold_power=(None if threshold_dbfs is None else
                      ADC_FULL_SCALE**2*10**(float(threshold_dbfs)/10))
+    def update_transport():
+        if session is not None:
+            session.transport_drops=dropped[0]
+            session.transport_read_errors=read_errors[0]
+            session.transport_buffer_restarts=buffer_restarts[0]
     try:
         sdr=connect(settings,False)
         run_settings=experiment_settings(settings,sdr)
@@ -383,7 +438,7 @@ def receive(settings, reference, folder, stop, emit):
             emit('log',f'Порог эфирного фона включён: {float(threshold_dbfs):.1f} dBFS.')
         def collect():
             offset=0
-            gap=False
+            gap=None
             tail=0
             pretrigger=deque(maxlen=2)
             def enqueue(item):
@@ -391,13 +446,38 @@ def receive(settings, reference, folder, stop, emit):
                 iq,clipping=item
                 try:
                     frames.put_nowait((iq,gap,clipping))
-                    gap=False
+                    gap=None
                 except queue.Full:
                     dropped[0]+=1
-                    gap=True
+                    gap='overflow'
             try:
                 while not capture_stop.is_set():
-                    raw=np.asarray(sdr.rx(),np.complex64)
+                    try:
+                        raw=read_rx_buffer(sdr)
+                    except OSError as error:
+                        if capture_stop.is_set() or stop.is_set():
+                            break
+                        read_errors[0]+=1
+                        retry=retryable_rx_error(error) and buffer_restarts[0]<RX_READ_RETRY_LIMIT
+                        read_error_events.append(dict(time_utc=utc_now(),
+                            elapsed_seconds=time.monotonic()-run_clock,error_type=type(error).__name__,
+                            errno=error.errno,message=str(error),retry=retry,
+                            captured_samples=captured_samples[0],traceback=traceback.format_exc()))
+                        if not retry:
+                            raise
+                        emit('log',f'Сбой чтения Pluto: {error}. Пересоздаю RX-буфер '
+                             f'({buffer_restarts[0]+1}/{RX_READ_RETRY_LIMIT}); разрыв IQ учтён.')
+                        sdr.rx_destroy_buffer()
+                        buffer_restarts[0]+=1
+                        # The new buffer is not contiguous with any retained samples.
+                        pretrigger.clear()
+                        tail=0
+                        offset=0
+                        gap='read_error'
+                        if capture_stop.wait(RX_READ_RETRY_DELAY*buffer_restarts[0]):
+                            break
+                        continue
+                    raw=np.asarray(raw,np.complex64)
                     # fs/4 oscillator has exactly four states, no growing float phase.
                     iq=raw*rx_mixer(len(raw),offset)
                     offset=(offset+len(raw))%4
@@ -420,7 +500,7 @@ def receive(settings, reference, folder, stop, emit):
                         if len(pretrigger)==pretrigger.maxlen:
                             pretrigger.popleft()
                             squelched[0]+=1
-                            gap=True
+                            gap='squelch'
                         pretrigger.append((iq,clipping))
             except Exception as e:
                 if not capture_stop.is_set():
@@ -432,26 +512,31 @@ def receive(settings, reference, folder, stop, emit):
         last_gap_log=0
         while not stop.is_set():
             if not errors.empty():
-                raise RuntimeError(f'Ошибка чтения SDR: {errors.get()}')
+                error=errors.get()
+                raise RuntimeError(f'Ошибка чтения SDR после {buffer_restarts[0]} пересозданий RX-буфера: {error}. '
+                    'Закройте программы, использующие этот Pluto, и переподключите USB. '
+                    'Если ошибка повторяется, проверьте сетевой URI Pluto и версии libiio; '
+                    'подробности сохранены в журнале RX.') from error
             try:
                 iq,gap,clipping=frames.get(timeout=.15)
             except queue.Empty:
                 now=time.monotonic()
                 if session and snapshot_dirty and now-last_snapshot>=RX_SNAPSHOT_INTERVAL:
-                    session.transport_drops=dropped[0]
+                    update_transport()
                     emit('snapshot',session.snapshot())
                     snapshot_dirty=False
                     last_snapshot=now
                 if now-last>.5:
                     emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
                         queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
-                        squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs))
+                        squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs,
+                        read_errors=read_errors[0],buffer_restarts=buffer_restarts[0]))
                     last=now
                 continue
             if gap:
                 decoder.reset()
                 now=time.monotonic()
-                if now-last_gap_log>=1:
+                if gap=='overflow' and now-last_gap_log>=1:
                     emit('log',f'Перегрузка обработки: потеряно IQ-буферов {dropped[0]}. Поиск пакета заново.')
                     last_gap_log=now
             if clipping>.001 and time.monotonic()-last_clip>3:
@@ -463,7 +548,7 @@ def receive(settings, reference, folder, stop, emit):
                 # must not exclude the rest of the same laboratory attempt.
                 if session is None or session.meta.transfer != packet.meta.transfer:
                     if session is not None:
-                        session.transport_drops=dropped[0]
+                        update_transport()
                         results.append(session.stats(True))
                         emit('log','Предыдущий результат: '+session.save(folder,True))
                     session=Reception(packet.meta,reference,settings['cfg'].mod,run_settings)
@@ -476,7 +561,7 @@ def receive(settings, reference, folder, stop, emit):
                          session.reference_status+suffix)
                 was_end=session.ended
                 session.accept(packet)
-                session.transport_drops=dropped[0]
+                update_transport()
                 snapshot_dirty=True
                 if session.ended and not was_end:
                     emit('log','Получен END. Передача принята; RX останавливается.')
@@ -490,7 +575,8 @@ def receive(settings, reference, folder, stop, emit):
             if now-last>.5:
                 emit('health',dict(candidates=decoder.candidates,header_failures=decoder.header_failures,
                     queue=frames.qsize(),queue_capacity=frames.maxsize,drops=dropped[0],
-                    squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs))
+                    squelched=squelched[0],input_dbfs=input_dbfs[0],squelch_dbfs=threshold_dbfs,
+                    read_errors=read_errors[0],buffer_restarts=buffer_restarts[0]))
                 last=now
     except Exception as error:
         failure=str(error)
@@ -504,7 +590,7 @@ def receive(settings, reference, folder, stop, emit):
         if sdr is not None and (capture is None or not capture.is_alive()):
             sdr.rx_destroy_buffer()
         if session:
-            session.transport_drops=dropped[0]
+            update_transport()
             emit('snapshot',session.snapshot(True))
             results.append(session.stats(True))
             emit('log','Результат: '+session.save(folder,True))
@@ -514,6 +600,8 @@ def receive(settings, reference, folder, stop, emit):
             status='failed' if failure else 'finished' if results else 'no_valid_header',
             error=failure,transfers=results,per=results[-1]['per'] if results else None,
             ber=results[-1]['ber'] if results else None,transport_dropped_buffers=dropped[0],
+            transport_read_errors=read_errors[0],transport_buffer_restarts=buffer_restarts[0],
+            read_error_events=read_error_events,
             squelched_buffers=squelched[0],captured_samples=captured_samples[0],
             clipped_samples=clipped_samples[0],
             clipping_fraction=clipped_samples[0]/captured_samples[0] if captured_samples[0] else None,

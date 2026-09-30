@@ -91,6 +91,7 @@ class EmitterApp(tk.Tk):
         signal.pack(fill='x', pady=10)
         self.signal_mode = tk.StringVar(value='packet')
         self.modulation = tk.StringVar(value='BPSK')
+        self.packet_kind = tk.StringVar(value='text')
         self.iq_path = tk.StringVar()
         self.iq_format = tk.StringVar(value='CS8 — signed int8 I/Q')
         self.tuning_mode = tk.StringVar(value='fixed')
@@ -117,6 +118,13 @@ class EmitterApp(tk.Tk):
                                        state='readonly', width=18)
         self.mod_widget.grid(row=1, column=1, sticky='w', padx=5)
         self.controls.append((self.mod_widget, 'readonly'))
+        ttk.Label(signal,text='Содержимое кадра').grid(row=1,column=2,sticky='w',padx=5)
+        self.packet_widgets=[]
+        for col,(kind,label) in enumerate((('text','Случайный текст'),('image','Красное изображение')),3):
+            widget=ttk.Radiobutton(signal,text=label,variable=self.packet_kind,value=kind)
+            widget.grid(row=1,column=col,sticky='w',padx=5)
+            self.packet_widgets.append(widget)
+            self.controls.append((widget,'normal'))
 
         ttk.Label(signal, text='Файл отсчётов').grid(row=2, column=0, sticky='w', padx=5, pady=5)
         self.iq_path_widget = ttk.Entry(signal, textvariable=self.iq_path, width=42)
@@ -163,7 +171,8 @@ class EmitterApp(tk.Tk):
         self.off_widget.pack(side='left', padx=4)
         self.controls += [(self.on_widget, 'normal'), (self.off_widget, 'normal')]
         ttk.Label(signal, text=(
-            'В режиме «кадры» используется реальный формат modem.py. В режиме шума '
+            'Кадры: случайный текст при каждом Start или красное RGB 16×16; формат modem.py. '
+            'Полоса — до sample rate. Амплитуда выше 100% допускает насыщение CS8. В режиме шума '
             'фиксированный сигнал заполняет полосу; при сканировании узкая шумовая полоса '
             'проходит по всей заданной полосе. В импульсном сканировании каждый импульс '
             'выполняет один полный проход; поле периода относится к непрерывному режиму. '
@@ -258,6 +267,7 @@ class EmitterApp(tk.Tk):
             rf_amp=self.rf_amp.get(),
             amplitude=self._number(self.amplitude.get()) / 100,
             signal_mode=self.signal_mode.get(), modulation=self.modulation.get(),
+            packet_kind=self.packet_kind.get(),
             tuning_mode=self.tuning_mode.get(), operation_mode=self.operation_mode.get(),
             sweep_period_ms=self._number(self.sweep_period.get()),
             pulse_on_ms=self._number(self.pulse_on.get()),
@@ -273,6 +283,8 @@ class EmitterApp(tk.Tk):
         if running:
             return
         self.mod_widget.configure(state='readonly' if self.signal_mode.get() == 'packet' else 'disabled')
+        for widget in self.packet_widgets:
+            widget.configure(state='normal' if self.signal_mode.get()=='packet' else 'disabled')
         file_state = self.signal_mode.get() == 'file'
         self.iq_path_widget.configure(state='normal' if file_state else 'disabled')
         self.iq_button.configure(state='normal' if file_state else 'disabled')

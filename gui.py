@@ -173,7 +173,7 @@ class App(tk.Tk):
             w=ttk.Entry(amplitude,textvariable=self.tx_amplitude,width=9)
             w.pack(side='left')
             self.controls.append((w,'normal'))
-            ttk.Label(amplitude,text='1…16384; прежний уровень 4096. Фиксируйте при сравнении модуляций.').pack(side='left',padx=8)
+            ttk.Label(amplitude,text='1…16384').pack(side='left',padx=8)
         else:
             squelch=ttk.Frame(rf)
             squelch.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
@@ -489,6 +489,8 @@ class App(tk.Tk):
             elif kind=='health' and not self.stop_event.is_set():
                 capacity=value.get('queue_capacity','?')
                 status=f'RX · IQ очередь {value["queue"]}/{capacity} · потери {value["drops"]}'
+                if value.get('read_errors'):
+                    status+=f' · сбои чтения {value["read_errors"]} · перезапуски буфера {value["buffer_restarts"]}'
                 if value.get('squelch_dbfs') is not None:
                     level=value.get('input_dbfs')
                     status+=f' · вход {"—" if level is None else f"{level:.1f}"} dBFS · отсечено {value["squelched"]}'

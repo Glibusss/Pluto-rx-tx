@@ -1,6 +1,7 @@
 import threading
 import csv
 import json
+import errno
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,24 @@ class FakeRX:
         self.destroyed=False
     def rx(self):return np.zeros(64,np.complex64)
     def rx_destroy_buffer(self):self.destroyed=True
+
+class ScriptedRX(FakeRX):
+    def __init__(self,actions,stop):
+        super().__init__()
+        self.actions=iter(actions)
+        self.stop=stop
+        self.destroy_count=0
+    def rx(self):
+        action=next(self.actions,None)
+        if isinstance(action,Exception):
+            raise action
+        if action is not None:
+            return action
+        self.stop.wait(.01)
+        return np.zeros(64,np.complex64)
+    def rx_destroy_buffer(self):
+        super().rx_destroy_buffer()
+        self.destroy_count+=1
 
 class NoWait:
     def is_set(self):return False
@@ -240,6 +259,118 @@ class RadioTests(unittest.TestCase):
             self.assertEqual(report['transfers'],[])
             self.assertIsNone(report['per'])
             self.assertIsNone(report['ber'])
+
+    def test_windows_masked_error_recovers_native_errno_without_using_stale_errno(self):
+        sdr=unittest.mock.Mock()
+        def masked_failure():
+            radio.ctypes.set_errno(errno.EBUSY)
+            raise OSError(0,'No error')
+        sdr.rx.side_effect=masked_failure
+        with self.assertRaises(OSError) as caught:
+            radio.read_rx_buffer(sdr)
+        self.assertEqual(caught.exception.errno,errno.EBUSY)
+        self.assertEqual(caught.exception.__cause__.errno,0)
+        # A previous DLL call's errno must not be attributed to a new failure.
+        radio.ctypes.set_errno(errno.EBUSY)
+        sdr.rx.side_effect=OSError(0,'No error')
+        with self.assertRaises(OSError) as caught:
+            radio.read_rx_buffer(sdr)
+        self.assertEqual(caught.exception.errno,0)
+        original=OSError(errno.EINVAL,'invalid buffer settings')
+        sdr.rx.side_effect=original
+        with self.assertRaises(OSError) as caught:
+            radio.read_rx_buffer(sdr)
+        self.assertIs(caught.exception,original)
+
+    def test_rx_recovers_first_buffer_failure_and_records_it(self):
+        cfg=Config(cfo_range=0);source=Source.text('after startup failure')
+        frames=[make_frame(source.meta(81,seq,end),b'' if end else source.payload(seq),cfg)
+                for seq,end in ((0,False),(source.total,True))]
+        raw=np.concatenate(frames)
+        raw=32*raw*np.exp(2j*np.pi*.25*np.arange(len(raw)))
+        stop=threading.Event();events=[]
+        sdr=ScriptedRX([OSError(0,'No error'),raw],stop)
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',0)):
+            radio.receive(dict(cfg=cfg),source,folder,stop,lambda *x:events.append(x))
+            report=json.loads(next((Path(folder)/'rx_runs').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(report['status'],'finished')
+            self.assertEqual(report['per'],0)
+            self.assertEqual(report['ber'],0)
+            self.assertEqual(report['transport_read_errors'],1)
+            self.assertEqual(report['transport_buffer_restarts'],1)
+            self.assertEqual(report['read_error_events'][0]['errno'],0)
+            self.assertTrue(report['read_error_events'][0]['retry'])
+            self.assertIn('No error',report['read_error_events'][0]['traceback'])
+            self.assertIn('python_executable',report['receiver_settings']['runtime'])
+            self.assertEqual(report['transfers'][0]['transport_read_errors'],1)
+        self.assertEqual(sdr.destroy_count,2)  # recovery, then final cleanup
+        self.assertTrue(any(kind=='log' and 'Пересоздаю' in value for kind,value in events))
+
+    def test_rx_never_joins_packet_halves_across_read_failure(self):
+        cfg=Config(cfo_range=0);source=Source.text('A'*768+'packet one')
+        frame0=make_frame(source.meta(82,0),source.payload(0),cfg)
+        frame1=make_frame(source.meta(82,1),source.payload(1),cfg)
+        end=make_frame(source.meta(82,source.total,True),b'',cfg)
+        raw=32*np.r_[frame0,frame1,end]
+        raw=raw*np.exp(2j*np.pi*.25*np.arange(len(raw)))
+        split=len(frame0)//2
+        stop=threading.Event()
+        sdr=ScriptedRX([raw[:split],OSError(errno.ETIMEDOUT,'timeout'),raw[split:]],stop)
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',0)):
+            radio.receive(dict(cfg=cfg),source,folder,stop,lambda *x:None)
+            stat=json.loads((Path(folder)/'transfer_0000000000000052'/'metrics.json').read_text(encoding='utf-8'))
+            self.assertEqual(stat['first_received_sequence'],1)
+            self.assertEqual(stat['good_packets'],1)
+            self.assertEqual(stat['missing_packets'],1)
+            self.assertEqual(stat['per'],.5)
+            self.assertEqual(stat['ber'],0)
+            self.assertEqual(stat['transport_read_errors'],1)
+            self.assertEqual(stat['transport_buffer_restarts'],1)
+            self.assertEqual(stat['transport_dropped_buffers'],0)
+
+    def test_rx_persistent_read_failure_has_bounded_retries_and_original_cause(self):
+        stop=threading.Event()
+        sdr=ScriptedRX([OSError(0,'No error') for _ in range(4)],stop)
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',0)):
+            with self.assertRaisesRegex(RuntimeError,'после 3') as caught:
+                radio.receive(dict(cfg=Config()),None,folder,stop,lambda *x:None)
+            self.assertIsInstance(caught.exception.__cause__,OSError)
+            report=json.loads(next((Path(folder)/'rx_runs').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(report['status'],'failed')
+            self.assertEqual(report['captured_samples'],0)
+            self.assertEqual(report['transport_read_errors'],4)
+            self.assertEqual(report['transport_buffer_restarts'],3)
+            self.assertEqual([e['retry'] for e in report['read_error_events']],[True,True,True,False])
+            self.assertIsNone(report['per'])
+        self.assertEqual(sdr.destroy_count,4)
+
+    def test_rx_does_not_retry_invalid_settings_or_programming_errors(self):
+        for error in (OSError(errno.EINVAL,'invalid settings'),ValueError('bad data format')):
+            stop=threading.Event();sdr=ScriptedRX([error],stop)
+            with (self.subTest(error=error),tempfile.TemporaryDirectory() as folder,
+                  patch.object(radio,'connect',return_value=sdr)):
+                with self.assertRaises(RuntimeError) as caught:
+                    radio.receive(dict(cfg=Config()),None,folder,stop,lambda *x:None)
+                self.assertIs(caught.exception.__cause__,error)
+                self.assertEqual(sdr.destroy_count,1)
+
+    def test_stop_interrupts_rx_recovery_wait(self):
+        stop=threading.Event();sdr=ScriptedRX([OSError(0,'No error')],stop)
+        def emit(kind,value):
+            if kind=='log' and 'Пересоздаю' in value:
+                stop.set()
+        started=radio.time.monotonic()
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',10)):
+            radio.receive(dict(cfg=Config()),None,folder,stop,emit)
+            report=json.loads(next((Path(folder)/'rx_runs').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(report['transport_read_errors'],1)
+            self.assertIsNone(report['error'])
+        self.assertLess(radio.time.monotonic()-started,2)
+        self.assertTrue(sdr.destroyed)
 
     def test_clipping_uses_twelve_bit_rails_and_checks_both_components(self):
         iq=np.array([100+100j,2040+0j,-2048+0j,0+2047j,0-2048j])

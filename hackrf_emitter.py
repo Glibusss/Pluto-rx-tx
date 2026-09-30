@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -22,7 +23,7 @@ import time
 import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
 
-from modem import Config, MODS, make_frame
+from modem import Config, MODS, PAYLOAD, PREAMBLE, frame_len, make_frame
 from session import Source
 
 
@@ -38,7 +39,9 @@ SIGNAL_MODES = ('packet', 'noise', 'file')
 IQ_FORMATS = ('cs8', 'cf32')
 TUNING_MODES = ('fixed', 'sweep')
 OPERATION_MODES = ('continuous', 'pulse')
-MAX_CYCLE_BYTES = 8 * 1024 * 1024
+PACKET_KINDS = ('text', 'image')
+IQ_CHUNK_SAMPLES = 262144
+REFERENCE_SAMPLES = 65536
 PACKET_RATE = 2_000_000
 STARTUP_STABILITY_SECONDS = 0.5
 START_RETRY_DELAYS = (0.4, 0.8)
@@ -217,22 +220,23 @@ class EmitterConfig:
     iq_format: str = 'cs8'
     serial: str = ''
     executable: str = 'hackrf_transfer'
+    packet_kind: str = 'text'
 
     def validate(self):
         if not HACKRF_MIN_FREQUENCY <= self.frequency_hz <= HACKRF_MAX_FREQUENCY:
             raise ValueError('Частота центра HackRF: 1…6000 МГц')
         if self.sample_rate not in HACKRF_SAMPLE_RATES:
             raise ValueError('Sample rate должен быть одним из 2, 4, 8, 10, 12, 16, 20 MS/s')
-        if not 1_000 <= self.bandwidth_hz <= int(self.sample_rate * 0.70):
-            raise ValueError('Полоса: 1 кГц…70% sample rate (оставлен защитный край)')
+        if not 0 < self.bandwidth_hz <= self.sample_rate:
+            raise ValueError('Полоса должна быть положительной и не превышать sample rate')
         half = self.bandwidth_hz / 2
         if (self.frequency_hz - half < HACKRF_MIN_FREQUENCY or
                 self.frequency_hz + half > HACKRF_MAX_FREQUENCY):
             raise ValueError('Вся заданная полоса должна находиться внутри 1…6000 МГц')
         if not 0 <= self.txvga_gain <= 47 or int(self.txvga_gain) != self.txvga_gain:
             raise ValueError('TX VGA gain HackRF: целое число 0…47 dB')
-        if not math.isfinite(self.amplitude) or not 0.01 <= self.amplitude <= 1.0:
-            raise ValueError('Цифровая амплитуда: 1…100%')
+        if not math.isfinite(self.amplitude) or self.amplitude < 0:
+            raise ValueError('Цифровая амплитуда должна быть конечным числом ≥0%')
         if self.signal_mode not in SIGNAL_MODES:
             raise ValueError('Неизвестный тип сигнала')
         if self.iq_format not in IQ_FORMATS:
@@ -241,19 +245,27 @@ class EmitterConfig:
             iq_file_sample_count(self)
         if self.modulation not in MODS:
             raise ValueError('Неизвестная модуляция')
+        if self.packet_kind not in PACKET_KINDS:
+            raise ValueError('Содержимое кадра: текст или изображение')
         if self.tuning_mode not in TUNING_MODES:
             raise ValueError('Неизвестный режим частоты')
         if self.operation_mode not in OPERATION_MODES:
             raise ValueError('Неизвестный режим работы')
-        if not 5 <= self.sweep_period_ms <= 10_000:
-            raise ValueError('Период сканирования: 5…10000 мс')
-        if not 1 <= self.pulse_on_ms <= 10_000 or not 1 <= self.pulse_off_ms <= 10_000:
-            raise ValueError('Длительность импульса и паузы: 1…10000 мс')
+        if not math.isfinite(self.sweep_period_ms) or self.sweep_period_ms<=0:
+            raise ValueError('Период сканирования должен быть конечным числом >0 мс')
+        if (not math.isfinite(self.pulse_on_ms) or self.pulse_on_ms<=0 or
+                not math.isfinite(self.pulse_off_ms) or self.pulse_off_ms<0):
+            raise ValueError('Длительность импульса должна быть >0 мс, паузы ≥0 мс')
         if not self.executable.strip():
             raise ValueError('Укажите путь к hackrf_transfer')
-        samples = cycle_sample_count(self)
-        if samples * 2 > MAX_CYCLE_BYTES:
-            raise ValueError('Цикл IQ превышает 8 MiB; уменьшите времена или sample rate')
+        cycle_sample_count(self)
+
+
+def _sample_count(sample_rate: int, duration_ms: float, minimum: int = 0) -> int:
+    samples = sample_rate * (duration_ms / 1000)
+    if not math.isfinite(samples) or samples > sys.maxsize:
+        raise ValueError('Длительность IQ-цикла не представима размером файла')
+    return max(minimum, int(round(samples)))
 
 
 def _active_sample_count(cfg: EmitterConfig) -> int:
@@ -266,13 +278,20 @@ def _active_sample_count(cfg: EmitterConfig) -> int:
         duration_ms = cfg.sweep_period_ms
     else:
         duration_ms = 100.0
-    return max(1, int(round(cfg.sample_rate * duration_ms / 1000)))
+    samples = _sample_count(cfg.sample_rate, duration_ms, 1)
+    if cfg.signal_mode=='packet' and cfg.operation_mode=='continuous' and cfg.tuning_mode=='fixed':
+        packet_samples=(len(PREAMBLE)+frame_len(Config(cfg.modulation,True,False,PACKET_RATE)))
+        packet_samples=packet_samples*cfg.sample_rate//PACKET_RATE
+        samples=((samples+packet_samples-1)//packet_samples)*packet_samples
+    return samples
 
 
 def cycle_sample_count(cfg: EmitterConfig) -> int:
     active = _active_sample_count(cfg)
     if cfg.operation_mode == 'pulse':
-        active += max(1, int(round(cfg.sample_rate * cfg.pulse_off_ms / 1000)))
+        active += _sample_count(cfg.sample_rate, cfg.pulse_off_ms)
+    if active > sys.maxsize:
+        raise ValueError('Длительность IQ-цикла не представима размером файла')
     return active
 
 
@@ -311,11 +330,18 @@ def load_iq_file(path: str | Path, iq_format: str) -> np.ndarray:
     return np.asarray(iq, np.complex64)
 
 
-def _packet_template(cfg: EmitterConfig) -> np.ndarray:
+def packet_source(cfg: EmitterConfig) -> Source:
+    if cfg.packet_kind=='image':
+        return Source(1,bytes((255,0,0))*(16*16),16,16,'Красное изображение HackRF 16×16')
+    return Source.text(secrets.token_hex(PAYLOAD//2),'Случайный текст HackRF')
+
+
+def _packet_template(cfg: EmitterConfig, source=None, transfer=None) -> np.ndarray:
     """Return one real frame made by the existing project modem."""
-    source = Source.text(('HackRF TX-emitter · ' + cfg.modulation + ' · ') * 8)
+    source = source if source is not None else packet_source(cfg)
+    transfer = secrets.randbits(64) if transfer is None else transfer
     modem_cfg = Config(cfg.modulation, True, False, PACKET_RATE)
-    frame = make_frame(source.meta(0x4841434B52465458, 0), source.payload(0), modem_cfg)
+    frame = make_frame(source.meta(transfer, 0), source.payload(0), modem_cfg)
     if cfg.sample_rate != PACKET_RATE:
         divisor = math.gcd(cfg.sample_rate, PACKET_RATE)
         frame = resample_poly(frame, cfg.sample_rate // divisor,
@@ -324,23 +350,9 @@ def _packet_template(cfg: EmitterConfig) -> np.ndarray:
     return (frame / max(peak, 1e-9)).astype(np.complex64)
 
 
-def _band_limited_noise(sample_count: int, sample_rate: int,
-                        width_hz: float) -> np.ndarray:
-    # Complex white noise through a linear-phase LPF occupies approximately
-    # -width/2…+width/2 around the configured RF center.
-    taps = 257
-    cutoff = float(np.clip(width_hz / sample_rate, 1e-5, 0.98))
-    kernel = firwin(taps, cutoff)
-    rng = np.random.default_rng(0x4841434B)
-    raw = (rng.standard_normal(sample_count + taps) +
-           1j * rng.standard_normal(sample_count + taps)).astype(np.complex64)
-    return lfilter(kernel, [1.0], raw)[taps:].astype(np.complex64)
-
-
-def frequency_track(cfg: EmitterConfig, sample_count: int) -> np.ndarray:
-    """Instantaneous digital frequency offset for one active interval."""
+def _frequency_slice(cfg, start, count, total):
     if cfg.tuning_mode == 'fixed':
-        return np.zeros(sample_count, np.float64)
+        return np.zeros(count, np.float64)
     if cfg.signal_mode == 'noise':
         # The instantaneous noise slice occupies 15% of the requested band;
         # its center scans through the rest, filling the band over time.
@@ -350,52 +362,134 @@ def frequency_track(cfg: EmitterConfig, sample_count: int) -> np.ndarray:
     # In pulse mode every RF burst makes one complete pass.  This keeps the
     # scan repeatable even when the requested ON/OFF timings are not a rational
     # multiple of the continuous-sweep period.
-    period = (sample_count if cfg.operation_mode == 'pulse' else
+    period = (total if cfg.operation_mode == 'pulse' else
               max(1.0, cfg.sample_rate * cfg.sweep_period_ms / 1000))
-    position = (np.arange(sample_count, dtype=np.float64) / period) % 1.0
+    position = (np.arange(start,start+count,dtype=np.float64) / period) % 1.0
     triangle = 4.0 * np.abs(position - 0.5) - 1.0
-    track = triangle * span / 2.0
+    return triangle * span / 2.0
+
+
+def frequency_track(cfg: EmitterConfig, sample_count: int) -> np.ndarray:
+    """Instantaneous digital frequency offset for one active interval."""
+    track = _frequency_slice(cfg,0,sample_count,sample_count)
     # A complete repeated period has zero accumulated phase at the boundary.
     if sample_count:
         track -= float(np.mean(track))
     return track
 
 
-def build_cycle(cfg: EmitterConfig) -> np.ndarray:
-    """Build one repeatable complex IQ cycle in the normalized [-1, 1] range."""
+class WaveformCancelled(Exception):
+    pass
+
+
+def _cancel_if_requested(stop):
+    if stop is not None and stop.is_set():
+        raise WaveformCancelled()
+
+
+def _baseband_chunks(cfg, template, active_count, chunk_samples, stop):
+    rng=np.random.default_rng(0x4841434B)
+    width=cfg.bandwidth_hz*(.15 if cfg.tuning_mode=='sweep' else 1)
+    kernel=None
+    if cfg.signal_mode=='noise' and width<cfg.sample_rate:
+        kernel=firwin(257,width/cfg.sample_rate)
+        state=np.zeros(len(kernel)-1,complex)
+        # Discard the initial filter transient, retaining its state.
+        warm=rng.standard_normal((len(kernel),2))
+        _,state=lfilter(kernel,[1.],warm[:,0]+1j*warm[:,1],zi=state)
+    for start in range(0,active_count,chunk_samples):
+        _cancel_if_requested(stop)
+        count=min(chunk_samples,active_count-start)
+        if cfg.signal_mode=='noise':
+            noise=rng.standard_normal((count,2))
+            chunk=noise[:,0]+1j*noise[:,1]
+            if kernel is not None:
+                chunk,state=lfilter(kernel,[1.],chunk,zi=state)
+        else:
+            length=len(template)//2 if cfg.signal_mode=='file' and cfg.iq_format=='cs8' else len(template)
+            indices=np.arange(start,start+count,dtype=np.int64)%length
+            if cfg.signal_mode=='file' and cfg.iq_format=='cs8':
+                chunk=(np.clip(template[indices*2].astype(float)/127,-1,1)+
+                       1j*np.clip(template[indices*2+1].astype(float)/127,-1,1))
+            else:
+                chunk=template[indices]
+        if not np.all(np.isfinite(chunk)):
+            raise ValueError('IQ-файл содержит NaN или бесконечность')
+        yield start,chunk
+
+
+def iter_cycle_chunks(cfg: EmitterConfig, chunk_samples=IQ_CHUNK_SAMPLES, stop=None,
+                      source=None, transfer=None):
+    """Generate a repeatable cycle with bounded RAM, independent of cycle length."""
     cfg.validate()
+    if chunk_samples<1:
+        raise ValueError('Размер порции IQ должен быть положительным')
     active_count = _active_sample_count(cfg)
     if cfg.signal_mode == 'packet':
-        template = _packet_template(cfg)
-        repeats = math.ceil(active_count / len(template))
-        active = np.tile(template, repeats)[:active_count]
-    elif cfg.signal_mode == 'noise':
-        width = (cfg.bandwidth_hz * 0.15 if cfg.tuning_mode == 'sweep'
-                 else cfg.bandwidth_hz)
-        active = _band_limited_noise(active_count, cfg.sample_rate, width)
+        template = _packet_template(cfg,source,transfer)
+    elif cfg.signal_mode=='file':
+        template=np.memmap(Path(cfg.iq_path).expanduser(),mode='r',
+                           dtype=np.int8 if cfg.iq_format=='cs8' else '<c8')
     else:
-        template = load_iq_file(cfg.iq_path, cfg.iq_format)
-        repeats = math.ceil(active_count / len(template))
-        active = np.tile(template, repeats)[:active_count]
+        template=None
+    # A bounded, uniformly spaced reference sample replaces a full-array quantile.
+    reference_indices=np.linspace(0,active_count-1,min(active_count,REFERENCE_SAMPLES),dtype=np.int64)
+    levels=np.empty(len(reference_indices),float)
+    track_sum=0.
+    for start,chunk in _baseband_chunks(cfg,template,active_count,chunk_samples,stop):
+        left=np.searchsorted(reference_indices,start)
+        right=np.searchsorted(reference_indices,start+len(chunk))
+        levels[left:right]=abs(chunk[reference_indices[left:right]-start])
+        if cfg.tuning_mode=='sweep':
+            track_sum+=float(np.sum(_frequency_slice(cfg,start,len(chunk),active_count),dtype=np.float64))
+    reference=max(float(np.quantile(levels,.999)),1e-9)
+    track_mean=track_sum/active_count
+    phase_cycles=0.
+    ramp_count=min(active_count//10,max(1,int(cfg.sample_rate*.001))) if cfg.operation_mode=='pulse' else 0
+    for start,chunk in _baseband_chunks(cfg,template,active_count,chunk_samples,stop):
+        if cfg.tuning_mode=='sweep':
+            track=_frequency_slice(cfg,start,len(chunk),active_count)-track_mean
+            phase=phase_cycles+np.cumsum(track,dtype=np.float64)/cfg.sample_rate
+            chunk=chunk*np.exp(2j*np.pi*phase)
+            phase_cycles=float(phase[-1])%1.
+        if ramp_count:
+            positions=np.arange(start,start+len(chunk))
+            distance=np.minimum(positions,active_count-1-positions)
+            ramp=np.ones(len(chunk),float)
+            edges=distance<ramp_count
+            ramp[edges]=(np.sin(np.pi/2*distance[edges]/(ramp_count-1))**2 if ramp_count>1 else 0.)
+            chunk=chunk*ramp
+        # CS8 physically saturates at its rails. Permit overdrive without int8 wrap
+        # or NaNs when finite but very large user amplitudes overflow a product.
+        with np.errstate(over='ignore'):
+            real=np.clip(np.asarray(chunk.real,np.float64)/reference*cfg.amplitude,-1,1)
+            imag=np.clip(np.asarray(chunk.imag,np.float64)/reference*cfg.amplitude,-1,1)
+        yield (real+1j*imag).astype(np.complex64)
+    idle_count=cycle_sample_count(cfg)-active_count
+    for start in range(0,idle_count,chunk_samples):
+        _cancel_if_requested(stop)
+        yield np.zeros(min(chunk_samples,idle_count-start),np.complex64)
 
-    if cfg.tuning_mode == 'sweep':
-        track = frequency_track(cfg, active_count)
-        phase = 2 * np.pi * np.cumsum(track, dtype=np.float64) / cfg.sample_rate
-        active = active * np.exp(1j * phase)
 
-    reference = float(np.quantile(np.abs(active), 0.999))
-    active = active * (cfg.amplitude / max(reference, 1e-9))
+def build_cycle(cfg: EmitterConfig, source=None, transfer=None) -> np.ndarray:
+    """In-memory convenience API; the transmitter writes large cycles in chunks."""
+    return np.concatenate(list(iter_cycle_chunks(cfg,source=source,transfer=transfer)))
 
-    if cfg.operation_mode == 'pulse':
-        # A short cosine ramp reduces switching splatter; the OFF part is exact zero.
-        ramp_count = min(active_count // 10, max(1, int(cfg.sample_rate * 0.001)))
-        ramp = np.sin(np.linspace(0, np.pi / 2, ramp_count, endpoint=True)) ** 2
-        active[:ramp_count] *= ramp
-        active[-ramp_count:] *= ramp[::-1]
-        idle_count = max(1, int(round(cfg.sample_rate * cfg.pulse_off_ms / 1000)))
-        active = np.r_[active, np.zeros(idle_count, np.complex64)]
 
-    return np.asarray(active, np.complex64)
+def write_cycle(cfg, path, stop=None, source=None, transfer=None, chunk_samples=IQ_CHUNK_SAMPLES):
+    _cancel_if_requested(stop)
+    cfg.validate()
+    path=Path(path)
+    required=cycle_sample_count(cfg)*2
+    if required>shutil.disk_usage(path.parent).free:
+        raise ValueError('Недостаточно свободного места для IQ-цикла: требуется '
+                         f'{required/1024**3:.2f} GiB')
+    samples=0
+    with path.open('wb') as stream:
+        for chunk in iter_cycle_chunks(cfg,chunk_samples,stop,source,transfer):
+            stream.write(complex_to_cs8(chunk))
+            samples+=len(chunk)
+    return samples
 
 
 def complex_to_cs8(iq: np.ndarray) -> bytes:
@@ -408,8 +502,7 @@ def complex_to_cs8(iq: np.ndarray) -> bytes:
 
 
 def select_filter_bandwidth(cfg: EmitterConfig) -> int:
-    wanted = max(1_750_000, min(int(cfg.sample_rate * 0.75),
-                               int(cfg.bandwidth_hz * 1.20)))
+    wanted = max(1_750_000,int(cfg.bandwidth_hz * 1.20))
     return min(BASEBAND_FILTERS, key=lambda value: (value < wanted, abs(value - wanted)))
 
 
@@ -512,10 +605,22 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
     try:
         iq_path = folder / 'waveform.cs8'
         emit('status', 'Формирование IQ…')
-        iq = build_cycle(cfg)
-        iq_path.write_bytes(complex_to_cs8(iq))
-        duration_ms = len(iq) / cfg.sample_rate * 1000
-        emit('log', f'IQ-цикл: {len(iq):,} отсчётов, {duration_ms:.1f} мс, '
+        source=packet_source(cfg) if cfg.signal_mode=='packet' else None
+        transfer=secrets.randbits(64) if source is not None else None
+        if source is not None:
+            emit('log',f'Кадр {transfer:016x}: '+source.label+'. DATA №0 повторяется до Stop; END не отправляется.')
+            if not source.kind:
+                emit('log','Текст кадра: '+source.raw.decode('utf-8'))
+        if cfg.amplitude>1:
+            emit('log',f'Цифровая амплитуда {cfg.amplitude:g}×: значения за пределами CS8 насыщаются.')
+        try:
+            samples=write_cycle(cfg,iq_path,stop,source,transfer)
+        except WaveformCancelled:
+            return
+        if stop.is_set():
+            return
+        duration_ms = samples / cfg.sample_rate * 1000
+        emit('log', f'IQ-цикл: {samples:,} отсчётов, {duration_ms:.1f} мс, '
                     f'{iq_path.stat().st_size / 1024 / 1024:.2f} MiB.')
         command = build_command(cfg, iq_path, executable)
         emit('log', 'Запуск: ' + subprocess.list2cmdline(command))
