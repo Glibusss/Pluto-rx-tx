@@ -5,6 +5,7 @@ import errno
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 import radio
@@ -55,7 +56,76 @@ class StopAfterWaits:
     def is_set(self):return self.waits>=self.count
     def wait(self,duration):self.waits+=1;return self.is_set()
 
+
+class FakeIIOAttribute:
+    def __init__(self,value):
+        self.value=str(value)
+
+class FakeStreamRate:
+    def __init__(self,sdr):
+        self.sdr=sdr
+    @property
+    def value(self):
+        rate=self.sdr.sample_rate//8 if self.sdr.interpolation else self.sdr.sample_rate
+        return str(rate)
+    @value.setter
+    def value(self,value):
+        if self.sdr.ignore_stream_write:return
+        rate=int(value)
+        if rate not in (self.sdr.sample_rate,self.sdr.sample_rate//8):
+            raise OSError('unsupported stream rate')
+        self.sdr.interpolation=rate!=self.sdr.sample_rate
+
+class FakePluto:
+    def __init__(self,ignore_stream_write=False):
+        self.sample_rate=1000000
+        self.interpolation=True
+        self.ignore_stream_write=ignore_stream_write
+        self.tx_hardwaregain_chan0=-10
+        self._ctx=SimpleNamespace(set_timeout=lambda value:None)
+        stream=SimpleNamespace(attrs={'sampling_frequency':FakeStreamRate(self)})
+        debug={name:FakeIIOAttribute(value) for name,value in
+               (('bist_prbs',1),('bist_tone','1'),('loopback',2))}
+        self._txdac=SimpleNamespace(find_channel=lambda name,output:stream)
+        self._ctrl=SimpleNamespace(debug_attrs=debug)
+
 class RadioTests(unittest.TestCase):
+    def test_tx_connect_restores_packet_stream_after_previous_test_settings(self):
+        # Pluto's PHY clock and DMA clock differ with FPGA interpolation enabled.
+        for rate in (1000000,2000000):
+            for interpolation in (False,True):
+                with self.subTest(rate=rate,interpolation=interpolation):
+                    sdr=FakePluto()
+                    sdr.interpolation=interpolation
+                    settings=dict(cfg=Config(sample_rate=rate),frequency=2400000000,
+                                  gain=-30,uri='test-pluto')
+                    with patch.dict('sys.modules',{'adi':SimpleNamespace(Pluto=lambda **kwargs:sdr)}):
+                        connected=radio.connect(settings,tx=True)
+                    stream=connected._txdac.find_channel('voltage0',True)
+                    self.assertEqual(int(stream.attrs['sampling_frequency'].value),rate)
+                    for name in ('bist_prbs','bist_tone','loopback'):
+                        self.assertEqual(int(connected._ctrl.debug_attrs[name].value.split()[0]),0)
+                    self.assertEqual(connected.tx_lo,2400000000-rate//4)
+                    self.assertEqual(connected.tx_hardwaregain_chan0,-30)
+
+    def test_tx_connect_rejects_wrong_real_stream_rate_with_output_muted(self):
+        sdr=FakePluto(ignore_stream_write=True)
+        settings=dict(cfg=Config(),frequency=2400000000,gain=-10,uri='test-pluto')
+        with patch.dict('sys.modules',{'adi':SimpleNamespace(Pluto=lambda **kwargs:sdr)}):
+            with self.assertRaisesRegex(RuntimeError,'125000'):
+                radio.connect(settings,tx=True)
+        self.assertEqual(sdr.tx_hardwaregain_chan0,-89.75)
+
+    def test_tx_journal_records_real_host_stream_rate(self):
+        sdr=FakePluto()
+        sdr.tx_lo=2399750000
+        settings=dict(cfg=Config(),frequency=2400000000,gain=-10,uri='test-pluto')
+        actual=radio.experiment_settings(settings,sdr,tx=True)['actual']
+        self.assertEqual(actual['sample_rate'],1000000)
+        self.assertEqual(actual['tx_stream_sample_rate'],125000)
+        self.assertEqual(actual['bist_prbs'],'1')
+
+
     def test_usb_discovery_prefers_pluto_and_ignores_non_usb(self):
         contexts={
             'ip:192.168.2.1':'Analog Devices PlutoSDR over network',

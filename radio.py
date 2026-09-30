@@ -102,6 +102,33 @@ def rx_mixer(length, offset):
     return wave
 
 
+def tx_stream_sample_rate(sdr):
+    device = getattr(sdr,'_txdac',None)
+    channel = device.find_channel('voltage0',True) if device is not None else None
+    if channel is None or 'sampling_frequency' not in channel.attrs:
+        return None
+    return int(channel.attrs['sampling_frequency'].value)
+
+
+def configure_tx_packet_path(sdr, sample_rate):
+    # BIST and loopback survive previous applications and can replace DMA samples.
+    for name,value in (('bist_prbs','0'),('bist_tone','0 0 0 0'),('loopback','0')):
+        attr = sdr._ctrl.debug_attrs.get(name)
+        if attr is not None:
+            attr.value = value
+            if int(attr.value.split()[0]) != 0:
+                raise RuntimeError(f'Pluto не отключил тестовый режим TX: {name}={attr.value}')
+    channel = sdr._txdac.find_channel('voltage0',True)
+    if channel is None or 'sampling_frequency' not in channel.attrs:
+        raise RuntimeError('Pluto не предоставляет частоту потока IQ TX')
+    # The DMA clock is separate from the PHY clock when FPGA interpolation is enabled.
+    channel.attrs['sampling_frequency'].value = str(sample_rate)
+    actual = tx_stream_sample_rate(sdr)
+    if actual != sample_rate:
+        raise RuntimeError(f'Pluto установил другую частоту потока IQ TX: {actual}; '
+                           f'ожидается {sample_rate} отсчётов/с')
+
+
 def experiment_settings(settings, sdr=None, tx=False):
     """Serializable requested settings and hardware values actually read back."""
     result = dict(processing_revision=PROCESSING_REVISION, phy_version=1,
@@ -128,6 +155,17 @@ def experiment_settings(settings, sdr=None, tx=False):
             value = getattr(sdr,name,None)
             if value is not None:
                 actual[name] = float(value) if 'gain' in name else int(value)
+
+        if tx:
+            stream_rate = tx_stream_sample_rate(sdr)
+            if stream_rate is not None:
+                actual['tx_stream_sample_rate'] = stream_rate
+            controller = getattr(sdr,'_ctrl',None)
+            if controller is not None:
+                for name in ('bist_prbs','bist_tone','loopback'):
+                    attr = controller.debug_attrs.get(name)
+                    if attr is not None:
+                        actual[name] = attr.value
         result['actual'] = actual
         result['runtime'] = sdr_runtime_info()
     return result
@@ -292,6 +330,8 @@ def connect(settings, tx=False):
     if not 326_000_000 <= frequency <= 3_800_000_000:
         raise ValueError('Частота центра: 326…3800 МГц для штатного Pluto')
     sdr = adi.Pluto(uri=settings['uri'])
+    if tx:
+        sdr.tx_hardwaregain_chan0=-89.75
     sdr._ctx.set_timeout(2000)
     sdr.sample_rate = cfg.sample_rate
     if int(sdr.sample_rate) != cfg.sample_rate:
@@ -300,10 +340,11 @@ def connect(settings, tx=False):
     lo = frequency-cfg.sample_rate//4
     if tx:
         sdr.tx_enabled_channels=[0]
+        configure_tx_packet_path(sdr,cfg.sample_rate)
         sdr.tx_lo=lo
         sdr.tx_rf_bandwidth=cfg.sample_rate
-        sdr.tx_hardwaregain_chan0=settings['gain']
         sdr.tx_cyclic_buffer=False
+        sdr.tx_hardwaregain_chan0=settings['gain']
     else:
         sdr.rx_enabled_channels=[0]
         sdr.rx_lo=lo
