@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -526,20 +525,39 @@ def resolve_executable(value: str) -> str:
         'hackrf_transfer не найден. Установите HackRF Tools или укажите полный путь к exe.')
 
 
+def interrupt_windows_console(pid: int):
+    # An isolated helper targets only hackrf_transfer's private console.
+    # hackrf_transfer handles CTRL_C_EVENT; CTRL_BREAK terminates it abruptly.
+    code = (
+        "import ctypes,sys,time\n"
+        "k=ctypes.WinDLL('kernel32',use_last_error=True)\n"
+        "k.FreeConsole()\n"
+        "if not k.AttachConsole(int(sys.argv[1])): raise ctypes.WinError(ctypes.get_last_error())\n"
+        "try:\n"
+        " if not k.SetConsoleCtrlHandler(None,True): raise ctypes.WinError(ctypes.get_last_error())\n"
+        " if not k.GenerateConsoleCtrlEvent(0,0): raise ctypes.WinError(ctypes.get_last_error())\n"
+        " time.sleep(.1)\n"
+        "finally: k.FreeConsole()\n"
+    )
+    subprocess.run([sys.executable, '-c', code, str(pid)], check=True, timeout=3,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+
+
 def stop_hackrf_process(process, windows: bool | None = None) -> str:
     """Stop hackrf_transfer gracefully when possible, then fall back to termination."""
     if process.poll() is not None:
         return 'already-stopped'
     windows = os.name == 'nt' if windows is None else windows
-    if windows and hasattr(signal, 'CTRL_BREAK_EVENT'):
+    if windows:
         try:
-            process.send_signal(signal.CTRL_BREAK_EVENT)
+            interrupt_windows_console(process.pid)
             process.wait(timeout=5)
-            return 'ctrl-break'
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 'ctrl-c'
+        except (OSError, ValueError, subprocess.SubprocessError):
             pass
     if process.poll() is not None:
-        return 'ctrl-break-late'
+        return 'interrupt-late'
     try:
         process.terminate()
         process.wait(timeout=3)
@@ -627,9 +645,12 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
         kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                       text=True, errors='replace', bufsize=1)
         if os.name == 'nt':
-            # hackrf_transfer handles CTRL_BREAK and shuts libhackrf/file handles
-            # down cleanly. A separate process group lets us target only it.
-            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            # A private hidden console allows Ctrl+C without signaling the GUI.
+            kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = subprocess.SW_HIDE
+            kwargs['startupinfo'] = startup
         output_lines: list[str] = []
         for launch_attempt in range(len(START_RETRY_DELAYS) + 1):
             output_lines = []

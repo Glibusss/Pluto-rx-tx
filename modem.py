@@ -240,8 +240,32 @@ def frame_len(cfg):
     return len(SYNC) + (H_BLOCKS+n)*block_len(cfg.cp)
 
 
+def align_block_timing(wave, count, cp, known):
+    """Follow sample-clock drift using each block's existing pilot sequence."""
+    length = block_len(cp)
+    prefix = CP_SYMBOLS*SPS if cp else 0
+    radius = 2*SPS
+    aligned = []
+    for index in range(count):
+        nominal = index*length + prefix
+        left = max(0, nominal-radius)
+        right = min(len(wave)-len(known), nominal+radius)
+        windows = np.lib.stride_tricks.sliding_window_view(
+            wave[left:right+len(known)], len(known))
+        energy = np.sum(abs(windows)**2, axis=1)
+        scores = abs(windows@known.conj())**2 / np.maximum(energy, 1e-15)
+        pilot = left + int(np.argmax(scores))
+        start = pilot-prefix
+        end = start+length
+        block = wave[max(0, start):min(len(wave), end)]
+        # Only CP or trailing PHY padding can extend past the available slice.
+        block = np.pad(block, (max(0, -start), max(0, end-len(wave))))
+        aligned.append(block)
+    return np.concatenate(aligned)
+
+
 def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
-    """Per-block pilots track phase/gain. Optional SC-FDE for linear payloads.
+    """Per-block pilots track timing/phase/gain. Optional SC-FDE for linear payloads.
 
     CP spans 128 samples. LS channel length 9 samples; pilot rows avoid unknown
     preceding data. Regularized frequency-domain inverse operates on each block.
@@ -250,6 +274,7 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
     length = block_len(cfg.cp)
     known = pilot_wave(fsk)
     known_energy = np.vdot(known, known)
+    wave = align_block_timing(wave, count, cfg.cp, known)
     if equalize and cfg.cp and not fsk:
         x, operator, taps = channel_estimator()
     out = []

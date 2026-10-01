@@ -103,6 +103,30 @@ class ModemTests(unittest.TestCase):
                 self.assertEqual(packets[0].payload,data)
                 self.assertTrue(packets[0].crc_ok)
 
+    def test_stream_payload_with_independent_sample_clocks(self):
+        rng = np.random.default_rng(912)
+        data = bytes((255, 0, 0))*256
+        for rate in (1_000_000, 2_000_000):
+            for cp in (False, True):
+                for ppm in (-120, 80, 120):
+                    cfg = Config('BPSK', True, cp, rate, 0)
+                    meta = Meta(1, 81, 0, 1, PAYLOAD, 16, 16, PAYLOAD, b'c'*16)
+                    frame = make_frame(meta, data, cfg)
+                    ratio = 1 + ppm*1e-6
+                    positions = np.arange(math.ceil(len(frame)*ratio))/ratio
+                    received = np.interp(positions, np.arange(len(frame)), frame)
+                    wave = np.r_[np.zeros(193), received, np.zeros(1000)]
+                    wave = .7*wave*np.exp(.73j)
+                    wave += .005*(rng.normal(size=len(wave))+1j*rng.normal(size=len(wave)))
+                    decoder = StreamDecoder(cfg)
+                    packets = []
+                    for chunk in np.array_split(wave, 13):
+                        packets += decoder.feed(chunk)
+                    with self.subTest(rate=rate, cp=cp, ppm=ppm):
+                        self.assertEqual(len(packets), 1)
+                        self.assertTrue(packets[0].crc_ok)
+                        self.assertEqual(packets[0].payload, data)
+
     def test_stream_near_cfo_search_edges(self):
         rng=np.random.default_rng(71)
         data=rng.integers(0,256,PAYLOAD,dtype=np.uint8).tobytes()

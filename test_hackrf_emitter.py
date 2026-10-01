@@ -395,6 +395,7 @@ class HackRFEmitterTests(unittest.TestCase):
                 return self.returncode
 
         class RunningProcess:
+            pid = 123
             stdout = io.StringIO('')
 
             def __init__(self):
@@ -426,6 +427,7 @@ class HackRFEmitterTests(unittest.TestCase):
                     side_effect=[(True, 'ready'), (True, 'ready')]) as ready,
               patch('hackrf_emitter.write_cycle',side_effect=lambda _cfg,path,*args:
                     (Path(path).write_bytes(b'\0\0') or 1)),
+              patch('hackrf_emitter.interrupt_windows_console'),
               patch('hackrf_emitter.STARTUP_STABILITY_SECONDS', 0),
               patch('hackrf_emitter.START_RETRY_DELAYS', (0,)),
               patch('hackrf_emitter.subprocess.Popen',
@@ -465,9 +467,11 @@ class HackRFEmitterTests(unittest.TestCase):
         self.assertEqual(events[0][0], 'log')
         self.assertIn('оставлен', events[0][1])
 
-    @unittest.skipUnless(hasattr(signal, 'CTRL_BREAK_EVENT'), 'Windows signal')
-    def test_hackrf_process_receives_graceful_ctrl_break(self):
+    @unittest.skipUnless(hasattr(signal, 'CTRL_C_EVENT'), 'Windows signal')
+    def test_hackrf_process_receives_graceful_ctrl_c(self):
         class FakeProcess:
+            pid = 123
+
             def __init__(self):
                 self.running = True
                 self.signals = []
@@ -487,8 +491,10 @@ class HackRFEmitterTests(unittest.TestCase):
                 self.terminated = True
 
         process = FakeProcess()
-        self.assertEqual(stop_hackrf_process(process, windows=True), 'ctrl-break')
-        self.assertEqual(process.signals, [signal.CTRL_BREAK_EVENT])
+        with patch('hackrf_emitter.interrupt_windows_console') as interrupt:
+            self.assertEqual(stop_hackrf_process(process, windows=True), 'ctrl-c')
+        interrupt.assert_called_once_with(process.pid)
+        self.assertEqual(process.signals, [])
         self.assertFalse(process.terminated)
 
     def test_unresponsive_process_is_reported_without_an_unhandled_timeout(self):

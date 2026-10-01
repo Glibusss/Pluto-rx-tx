@@ -34,7 +34,7 @@ NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
 RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
-PROCESSING_REVISION = 'cached-ls-fft-v1'
+PROCESSING_REVISION = 'pilot-timing-fft-v2'
 
 
 def read_rx_buffer(sdr):
