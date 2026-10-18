@@ -313,6 +313,31 @@ class RadioTests(unittest.TestCase):
             self.assertEqual(stat['ber_coverage'],0)
             self.assertTrue(stat['first_header_was_end'])
 
+    def test_rx_spectrum_is_emitted_before_squelch_without_valid_packets(self):
+        stop=threading.Event()
+        class QuietRX:
+            rx_lo=2399750000
+            destroyed=False
+            def rx(self):
+                stop.set()
+                return np.zeros(4096,np.complex64)
+            def rx_destroy_buffer(self):
+                self.destroyed=True
+        sdr=QuietRX()
+        decoder=unittest.mock.Mock(candidates=0,header_failures=0)
+        events=[]
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(radio,'connect',return_value=sdr),
+              patch.object(radio,'StreamDecoder',return_value=decoder)):
+            radio.receive(dict(cfg=Config(),frequency=2400000000,squelch_dbfs=-20),
+                          None,folder,stop,lambda *event:events.append(event))
+        traces=[value for kind,value in events if kind=='spectrum']
+        self.assertEqual(len(traces),1)
+        self.assertEqual(traces[0]['signal_frequency'],2400000000)
+        self.assertEqual(traces[0]['frequency'][2048],sdr.rx_lo)
+        self.assertTrue(sdr.destroyed)
+        decoder.feed.assert_not_called()
+
     def test_rx_no_header_records_run_without_inventing_per(self):
         stop=threading.Event()
         decoder=unittest.mock.Mock(candidates=0,header_failures=0)

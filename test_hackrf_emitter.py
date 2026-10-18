@@ -140,6 +140,8 @@ class HackRFEmitterTests(unittest.TestCase):
                     serial='',executable='hackrf_transfer',rf_amp=True)
         app=SimpleNamespace(_number=EmitterApp._number,
                             **{name:Mock(get=Mock(return_value=value)) for name,value in values.items()})
+        app.phy=Mock(config=Mock(return_value=Config(sample_rate=2000000)))
+        app.packet_rate=Mock(get=Mock(return_value='2'))
         cfg=EmitterApp.settings(app)
         self.assertEqual(cfg.packet_kind,'image')
         self.assertEqual(cfg.amplitude,2)

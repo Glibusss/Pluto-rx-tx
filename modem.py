@@ -1,7 +1,7 @@
 """Packet PHY. No SDR or GUI imports; deterministic and independently testable."""
 from __future__ import annotations
-import hashlib
 import math
+import json
 import struct
 import zlib
 from dataclasses import dataclass
@@ -10,31 +10,22 @@ import numpy as np
 from scipy.fft import fft, ifft, next_fast_len
 from scipy.signal import find_peaks
 from scipy.optimize import minimize_scalar
+from quality import pilot_energies, vector_energies
 
-MODS = ('ASK / OOK', '2-FSK', 'BPSK', 'QPSK', '8-PSK', 'QAM-4', 'QAM-16', 'QAM-64')
-SPS = 8
+from modulations import (MODS, SPS, bits, pack, constellation, symbols, bit_symbols,
+                         decisions, decision_error_energies, to_wave, fsk as fsk_mod)
+
 DATA_SYMBOLS = 128
 PILOT_SYMBOLS = 32
 CP_SYMBOLS = 16
 PAYLOAD = 768
 MAX_BYTES = 32 * 1024 * 1024
+PHY_VERSION = 2
 MAGIC = bytes.fromhex('d391c5a76e2b48f0')
-HEADER = struct.Struct('!BBBBQIIIHHH16s')
+HEADER = struct.Struct('!BBBBQIIIHHH16sI')
 HEADER_BYTES = HEADER.size + 4
 H_SYMBOLS = HEADER_BYTES * 8 * 3
 H_BLOCKS = math.ceil(H_SYMBOLS / DATA_SYMBOLS)
-SYNC_BITS = np.unpackbits(np.frombuffer(MAGIC, np.uint8))
-SYNC = np.repeat(2.0 * SYNC_BITS - 1.0, SPS).astype(np.complex64)
-PILOTS = (2 * np.random.default_rng(7729).integers(0, 2, PILOT_SYMBOLS) - 1).astype(np.complex64)
-PREAMBLE = np.repeat(2 * np.random.default_rng(331).integers(0, 2, 256) - 1, SPS).astype(np.complex64)
-
-
-def bits(data):
-    return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-
-
-def pack(b):
-    return np.packbits(np.asarray(b, np.uint8)).tobytes()
 
 
 def whitening(n, seed):
@@ -45,111 +36,68 @@ def whiten(data, seed):
     return (np.frombuffer(data, np.uint8) ^ whitening(len(data), seed)).tobytes()
 
 
-@lru_cache(maxsize=len(MODS))
-def constellation(mod):
-    pts, k = _constellation(mod)
-    pts.setflags(write=False)
-    return pts, k
+def tile_shape(payload_bytes):
+    pixels = payload_bytes // 3
+    width = math.isqrt(pixels)
+    while pixels % width:
+        width -= 1
+    return width, pixels // width
 
 
-def _constellation(mod):
-    if mod == 'ASK / OOK':
-        return np.array([0, np.sqrt(2)], complex), 1
-    if mod == 'BPSK':
-        return np.array([-1, 1], complex), 1
-    if mod in ('QPSK', '8-PSK'):
-        k = 2 if mod == 'QPSK' else 3
-        # Integer index is the bit label; adjacent phase points have Gray labels.
-        pts = np.empty(2**k, complex)
-        for p in range(2**k):
-            pts[p ^ (p >> 1)] = np.exp(1j * (2*np.pi*p/(2**k) + np.pi/(2**k)))
-        return pts, k
-    if mod.startswith('QAM-'):
-        k = int(math.log2(int(mod.split('-')[1])))
-        ki, kq = (k+1)//2, k//2
-        def levels(k):
-            result = np.empty(2**k)
-            for p in range(2**k):
-                result[p ^ (p >> 1)] = 2*p - (2**k-1)
-            return result
-        a, b = levels(ki), levels(kq)
-        pts = np.array([i+1j*q for i in a for q in b])
-        return pts / np.sqrt(np.mean(abs(pts)**2)), k
-    if mod == '2-FSK':
-        return np.array([-1, 1]), 1
-    raise ValueError(mod)
-
-
-def symbols(data, mod):
-    pts, k = constellation(mod)
-    b = bits(data)
-    b = np.pad(b, (0, (-len(b)) % k)).reshape(-1, k)
-    labels = b @ (1 << np.arange(k-1, -1, -1))
+@lru_cache(maxsize=64)
+def pilot_symbols(cfg):
+    pts, _ = constellation(cfg.mod, cfg)
+    labels = np.random.default_rng(cfg.pilot_seed).integers(0, len(pts), cfg.pilot_symbols)
+    labels[0] = labels[-1] = len(pts)-1  # At least two active OOK pilots for phase fitting.
     return pts[labels]
 
 
-def decisions(z, mod):
-    pts, k = constellation(mod)
-    labels = np.argmin(abs(z[:, None] - pts[None, :])**2, axis=1)
-    return ((labels[:, None] >> np.arange(k-1, -1, -1)) & 1).astype(np.uint8).ravel()
+@lru_cache(maxsize=64)
+def pilot_wave(cfg):
+    return to_wave(pilot_symbols(cfg), cfg.mod == '2-FSK', cfg.fsk_cycles)
 
 
-def decision_error_energies(z, mod):
-    """Return decision-vector signal and error energies for an EVM-based SIR."""
-    z = np.asarray(z)
-    if not len(z):
-        return 0., 0.
-    if mod == '2-FSK':
-        choose_one = abs(z[:, 1]) > abs(z[:, 0])
-        decided = np.column_stack((~choose_one, choose_one)).astype(complex)
-    else:
-        pts, _ = constellation(mod)
-        labels = np.argmin(abs(z[:, None] - pts[None, :])**2, axis=1)
-        decided = pts[labels]
-    error = z - decided
-    return float(np.sum(abs(decided)**2)), float(np.sum(abs(error)**2))
+@lru_cache(maxsize=64)
+def preamble_wave(cfg):
+    if not cfg.preamble:
+        return np.empty(0, np.complex64)
+    pts, _ = constellation(cfg.mod, cfg)
+    z = pts[np.random.default_rng(cfg.preamble_seed).integers(0, len(pts), cfg.preamble_symbols)]
+    return to_wave(z, cfg.mod == '2-FSK', cfg.fsk_cycles)
 
 
-def to_wave(z, fsk=False):
-    if fsk:
-        return np.exp(2j*np.pi*np.asarray(z)[:, None]*np.arange(SPS)/SPS).ravel().astype(np.complex64)
-    return np.repeat(z, SPS).astype(np.complex64)
+@lru_cache(maxsize=64)
+def sync_wave(cfg):
+    # Keep 64 symbols for robust acquisition for every constellation order.
+    k = constellation(cfg.mod, cfg)[1]
+    return to_wave(symbols(MAGIC*k, cfg.mod, cfg), cfg.mod == '2-FSK', cfg.fsk_cycles)
 
 
-@lru_cache(maxsize=2)
-def pilot_wave(fsk=False):
-    known = to_wave(PILOTS.real if fsk else PILOTS, fsk)
-    known.setflags(write=False)
-    return known
-
-
-@lru_cache(maxsize=1)
-def channel_estimator():
-    """The pilot-only regularized LS operator is independent of received IQ."""
-    known = pilot_wave()
+@lru_cache(maxsize=32)
+def channel_estimator(cfg):
+    known = pilot_wave(cfg)
     taps = 9
     indices = np.arange(taps-1, len(known))[:, None] - np.arange(taps)
     x = known[indices]
     operator = np.linalg.solve(x.conj().T@x + 0.05*np.eye(taps), x.conj().T)
-    x.setflags(write=False)
-    operator.setflags(write=False)
     return x, operator, taps
 
 
-FSK_TONE = np.exp(2j*np.pi*np.arange(SPS)/SPS)
+def block_len(cfg):
+    return (cfg.pilot_symbols + cfg.data_symbols + (cfg.cp_symbols if cfg.cp else 0)) * SPS
 
 
-def block_len(cp):
-    return (PILOT_SYMBOLS + DATA_SYMBOLS + (CP_SYMBOLS if cp else 0)) * SPS
+def header_blocks(cfg):
+    return math.ceil(math.ceil(H_SYMBOLS/constellation(cfg.mod, cfg)[1])/cfg.data_symbols)
 
 
-def encode_blocks(z, cp, fsk=False):
-    z = np.pad(z, (0, (-len(z)) % DATA_SYMBOLS))
+def encode_blocks(z, cfg):
+    z = np.pad(z, (0, (-len(z)) % cfg.data_symbols), constant_values=constellation(cfg.mod,cfg)[0][0])
     out = []
-    for row in z.reshape(-1, DATA_SYMBOLS):
-        wave = to_wave(np.r_[PILOTS.real if fsk else PILOTS, row], fsk)
-        if cp:
-            wave = np.r_[wave[-CP_SYMBOLS*SPS:], wave]
+    for row in z.reshape(-1, cfg.data_symbols):
+        wave = to_wave(np.r_[pilot_symbols(cfg), row], cfg.mod == '2-FSK', cfg.fsk_cycles)
+        if cfg.cp:
+            wave = np.r_[wave[-cfg.cp_symbols*SPS:], wave]
         out.append(wave)
     return np.concatenate(out).astype(np.complex64)
 
@@ -161,6 +109,29 @@ class Config:
     cp: bool = False
     sample_rate: int = 1_000_000
     cfo_range: float = 40_000
+    preamble_symbols: int = 256
+    preamble_seed: int = 331
+    cp_symbols: int = 16
+    pilot_symbols: int = 32
+    pilot_seed: int = 7729
+    data_symbols: int = 128
+    payload_bytes: int = 768
+    phase_deg: float = 0.
+    ook_low: float = 0.
+    fsk_cycles: float = 1.
+
+    def profile_tag(self):
+        # Receiver search range is local; all transmitted parameters must match.
+        values = {name: getattr(self, name) for name in (
+            'mod', 'preamble', 'cp', 'sample_rate', 'preamble_symbols', 'preamble_seed',
+            'cp_symbols', 'pilot_symbols', 'pilot_seed', 'data_symbols', 'payload_bytes')}
+        if self.mod == 'ASK / OOK':
+            values['ook_low'] = float(self.ook_low)
+        elif self.mod == '2-FSK':
+            values['fsk_cycles'] = float(self.fsk_cycles)
+        else:
+            values['phase_deg'] = float(self.phase_deg)
+        return zlib.crc32(json.dumps(values, sort_keys=True).encode())
 
     def validate(self):
         if self.mod not in MODS:
@@ -169,6 +140,28 @@ class Config:
             raise ValueError('Sample rate: 1 или 2 MS/s')
         if not 0 <= self.cfo_range <= 100_000:
             raise ValueError('Поиск CFO: 0…100000 Гц')
+        for name, low, high in (('preamble_symbols',64,4096), ('cp_symbols',1,256),
+                               ('pilot_symbols',8,256), ('data_symbols',32,1024),
+                               ('payload_bytes',48,12288), ('preamble_seed',0,2**32-1),
+                               ('pilot_seed',0,2**32-1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f'{name}: целое число {low}…{high}')
+        # Half-integer tone cycles remain orthogonal and fit the Fs/4 RF offset.
+        if not math.isfinite(self.fsk_cycles) or self.fsk_cycles not in (0.5,1.,1.5):
+            raise ValueError('Отклонение FSK: 0.5, 1 или 1.5 × Rs')
+        if self.cp_symbols > self.pilot_symbols+self.data_symbols:
+            raise ValueError('CP не должен быть длиннее блока пилотов и данных')
+        if not math.isfinite(self.phase_deg) or not -180 <= self.phase_deg <= 180:
+            raise ValueError('Поворот созвездия: −180…180°')
+        if not math.isfinite(self.ook_low) or not 0 <= self.ook_low <= 0.9:
+            raise ValueError('Нижний уровень ASK: 0…0.9 от верхнего')
+
+
+# Compatibility names describe only the default BPSK profile.
+PREAMBLE = preamble_wave(Config())
+SYNC = sync_wave(Config())
+
 
 
 @dataclass(frozen=True)
@@ -183,12 +176,13 @@ class Meta:
     length: int
     digest: bytes
     end: bool = False
+    payload_bytes: int = PAYLOAD
 
     def encode(self, cfg):
         flags = int(cfg.preamble) | (int(cfg.cp)<<1) | (int(self.end)<<2)
-        h = HEADER.pack(1, self.kind, MODS.index(cfg.mod), flags, self.transfer,
+        h = HEADER.pack(PHY_VERSION, self.kind, MODS.index(cfg.mod), flags, self.transfer,
                         self.seq, self.total, self.size, self.width, self.height,
-                        self.length, self.digest)
+                        self.length, self.digest, cfg.profile_tag())
         return h + struct.pack('!I', zlib.crc32(h))
 
     @classmethod
@@ -196,12 +190,13 @@ class Meta:
         h, check = raw[:-4], raw[-4:]
         if len(raw) != HEADER_BYTES or zlib.crc32(h) != int.from_bytes(check, 'big'):
             raise ValueError('header CRC')
-        ver, kind, mod, flags, tid, seq, total, size, w, h, length, digest = HEADER.unpack(h)
-        if ver != 1 or kind not in (0, 1) or mod != MODS.index(cfg.mod):
+        ver, kind, mod, flags, tid, seq, total, size, w, h, length, digest, profile = HEADER.unpack(h)
+        if ver != PHY_VERSION or profile != cfg.profile_tag() or kind not in (0, 1) or mod != MODS.index(cfg.mod):
             raise ValueError('header version/type/modulation')
         if flags & 3 != int(cfg.preamble) | (int(cfg.cp)<<1) or flags & ~7:
             raise ValueError('header flags')
-        expected = math.ceil(w/16)*math.ceil(h/16) if kind else math.ceil(size/PAYLOAD)
+        tw, th = tile_shape(cfg.payload_bytes)
+        expected = math.ceil(w/tw)*math.ceil(h/th) if kind else math.ceil(size/cfg.payload_bytes)
         if not 0 < size <= MAX_BYTES or not 0 < total <= 65536 or total != expected:
             raise ValueError('header size/count')
         if kind and (not w or not h or size != w*h*3):
@@ -209,12 +204,12 @@ class Meta:
         if not kind and (w or h):
             raise ValueError('header text dimensions')
         end = bool(flags & 4)
-        want_length = 0 if end else (PAYLOAD if kind else min(PAYLOAD, size-seq*PAYLOAD))
+        want_length = 0 if end else (tw*th*3 if kind else min(cfg.payload_bytes, size-seq*cfg.payload_bytes))
         if (end and seq != total) or (not end and not 0 <= seq < total):
             raise ValueError('header sequence')
         if length != want_length:
             raise ValueError('header payload length')
-        return cls(kind, tid, seq, total, size, w, h, length, digest, end)
+        return cls(kind, tid, seq, total, size, w, h, length, digest, end, cfg.payload_bytes)
 
 
 def payload_seed(meta):
@@ -222,28 +217,29 @@ def payload_seed(meta):
 
 
 def make_frame(meta, data, cfg):
-    if len(data) != meta.length:
-        raise ValueError('payload length mismatch')
+    cfg.validate()
+    if len(data) != meta.length or meta.payload_bytes != cfg.payload_bytes:
+        raise ValueError('payload length/profile mismatch')
     hb = np.repeat(bits(whiten(meta.encode(cfg), 9121)), 3)
-    header = encode_blocks(2.0*hb-1, cfg.cp)
-    # Fixed PHY length, including END, so streaming decoder never trusts a corrupt length.
-    padded = data.ljust(PAYLOAD, b'\0')
+    header = encode_blocks(bit_symbols(hb, cfg.mod, cfg), cfg)
+    # Fixed frame length within a profile, including END.
+    padded = data.ljust(cfg.payload_bytes, b'\0')
     body = padded + struct.pack('!I', zlib.crc32(data))
-    encoded = encode_blocks(symbols(whiten(body, payload_seed(meta)), cfg.mod), cfg.cp, cfg.mod == '2-FSK')
-    return np.r_[PREAMBLE if cfg.preamble else np.empty(0), SYNC, header, encoded].astype(np.complex64)
+    encoded = encode_blocks(symbols(whiten(body, payload_seed(meta)), cfg.mod, cfg), cfg)
+    return np.r_[preamble_wave(cfg), sync_wave(cfg), header, encoded].astype(np.complex64)
 
 
 def frame_len(cfg):
-    k = constellation(cfg.mod)[1]
-    n = math.ceil(math.ceil((PAYLOAD+4)*8/k)/DATA_SYMBOLS)
-    # From header marker; optional preamble is consumed as unframed leading samples.
-    return len(SYNC) + (H_BLOCKS+n)*block_len(cfg.cp)
+    k = constellation(cfg.mod, cfg)[1]
+    n = math.ceil(math.ceil((cfg.payload_bytes+4)*8/k)/cfg.data_symbols)
+    # From marker; the optional preamble is consumed by the stream decoder.
+    return len(sync_wave(cfg)) + (header_blocks(cfg)+n)*block_len(cfg)
 
 
-def align_block_timing(wave, count, cp, known):
+def align_block_timing(wave, count, cfg, known):
     """Follow sample-clock drift using each block's existing pilot sequence."""
-    length = block_len(cp)
-    prefix = CP_SYMBOLS*SPS if cp else 0
+    length = block_len(cfg)
+    prefix = cfg.cp_symbols*SPS if cfg.cp else 0
     radius = 2*SPS
     aligned = []
     for index in range(count):
@@ -264,29 +260,42 @@ def align_block_timing(wave, count, cp, known):
     return np.concatenate(aligned)
 
 
-def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
+def decode_blocks(wave, count, cfg, fsk=False, equalize=False, quality=None):
     """Per-block pilots track timing/phase/gain. Optional SC-FDE for linear payloads.
 
-    CP spans 128 samples. LS channel length 9 samples; pilot rows avoid unknown
+    CP length is configurable. LS channel length 9 samples; pilot rows avoid unknown
     preceding data. Regularized frequency-domain inverse operates on each block.
     FSK uses two noncoherent correlators (no channel inverse).
     """
-    length = block_len(cfg.cp)
-    known = pilot_wave(fsk)
+    length = block_len(cfg)
+    known = pilot_wave(cfg)
     known_energy = np.vdot(known, known)
-    wave = align_block_timing(wave, count, cfg.cp, known)
+    wave = align_block_timing(wave, count, cfg, known)
     if equalize and cfg.cp and not fsk:
-        x, operator, taps = channel_estimator()
+        x, operator, taps = channel_estimator(cfg)
     out = []
     for block in wave[:count*length].reshape(count, length):
         if cfg.cp:
-            block = block[CP_SYMBOLS*SPS:]
+            block = block[cfg.cp_symbols*SPS:]
         pilot_rx = block[:len(known)]
+        if quality is not None:
+            # Measure before estimating phase/gain/channel from these same pilots.
+            rows = pilot_rx.reshape(cfg.pilot_symbols, SPS)
+            if fsk:
+                observed = fsk_mod.observe(rows, cfg.fsk_cycles)
+                reference = np.column_stack((pilot_symbols(cfg).real < 0,
+                                             pilot_symbols(cfg).real > 0)).astype(complex)
+            else:
+                observed = rows[:,2:-2].mean(axis=1)
+                reference = pilot_symbols(cfg)
+            quality.append(pilot_energies(observed, reference))
         # Estimate residual frequency on known pilot waveforms, in sample domain.
         despread = pilot_rx * known.conj()
-        grouped = despread.reshape(PILOT_SYMBOLS, SPS).mean(axis=1)
-        phase = np.unwrap(np.angle(grouped))
-        slope, intercept = np.polyfit(np.arange(PILOT_SYMBOLS)*SPS+(SPS-1)/2, phase, 1)
+        grouped = despread.reshape(cfg.pilot_symbols, SPS).mean(axis=1)
+        active = np.mean(abs(known.reshape(-1, SPS))**2, axis=1) > 1e-12
+        phase = np.unwrap(np.angle(grouped[active]))
+        times = (np.arange(cfg.pilot_symbols)*SPS+(SPS-1)/2)[active]
+        slope, intercept = np.polyfit(times, phase, 1)
         # Fixed CFO was acquired on header; suppress noisy estimates for each short block.
         slope = float(np.clip(slope, -0.01, 0.01))
         block = block * np.exp(-1j*(slope*np.arange(len(block))+intercept))
@@ -302,10 +311,9 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False):
             block = np.fft.ifft(np.fft.fft(block)*hf.conj()/(abs(hf)**2+floor))
         else:
             block = block / gain
-        rows = block[len(known):].reshape(DATA_SYMBOLS, SPS)
+        rows = block[len(known):].reshape(cfg.data_symbols, SPS)
         if fsk:
-            r0, r1 = rows@FSK_TONE / SPS, rows@FSK_TONE.conj() / SPS
-            out.append(np.column_stack((r0, r1)))
+            out.append(fsk_mod.observe(rows, cfg.fsk_cycles))
         else:
             # All samples after SC-FDE; skip symbol edges otherwise to reduce ISI.
             out.append(rows.mean(axis=1) if equalize and cfg.cp else rows[:, 2:-2].mean(axis=1))
@@ -323,34 +331,60 @@ class Decoded:
     sir_signal_energy: float = 0.
     sir_interference_energy: float = 0.
     sir_vector_count: int = 0
+    pilot_signal_energy: float = 0.
+    pilot_disturbance_energy: float = 0.
+    pilot_sample_count: int = 0
+    crc_signal_energy: float = 0.
+    crc_error_energy: float = 0.
+    crc_symbol_count: int = 0
 
 
 def decode_frame(wave, cfg, cfo, score=1.):
     wave = wave * np.exp(-2j*np.pi*cfo*np.arange(len(wave))/cfg.sample_rate)
-    # Full marker refines coarse frequency estimate before decoding all blocks.
-    d = (wave[:len(SYNC)]*SYNC.conj()).reshape(-1, SPS).mean(axis=1)
-    phase = np.unwrap(np.angle(d))
-    slope, intercept = np.polyfit(np.arange(len(d))*SPS+(SPS-1)/2, phase, 1)
+    sync = sync_wave(cfg)
+    d = (wave[:len(sync)]*sync.conj()).reshape(-1, SPS).mean(axis=1)
+    active = np.mean(abs(sync.reshape(-1, SPS))**2, axis=1) > 1e-12
+    phase = np.unwrap(np.angle(d[active]))
+    times = (np.arange(len(d))*SPS+(SPS-1)/2)[active]
+    slope, intercept = np.polyfit(times, phase, 1)
     wave *= np.exp(-1j*(slope*np.arange(len(wave))+intercept))
     cfo += slope*cfg.sample_rate/(2*np.pi)
-    cursor = len(SYNC)
-    hsize = H_BLOCKS*block_len(cfg.cp)
-    hz = decode_blocks(wave[cursor:cursor+hsize], H_BLOCKS, cfg)
-    hb = (hz.real[:H_SYMBOLS] >= 0).reshape(-1, 3).sum(axis=1) >= 2
+    cursor = len(sync)
+    nh = header_blocks(cfg)
+    hsize = nh*block_len(cfg)
+    hz = decode_blocks(wave[cursor:cursor+hsize], nh, cfg, cfg.mod == '2-FSK')
+    repeated = decisions(hz, cfg.mod, cfg)[:H_SYMBOLS]
+    hb = repeated.reshape(-1, 3).sum(axis=1) >= 2
     meta = Meta.decode(whiten(pack(hb), 9121), cfg)
     cursor += hsize
-    k = constellation(cfg.mod)[1]
-    nsyms = math.ceil((PAYLOAD+4)*8/k)
-    nblocks = math.ceil(nsyms/DATA_SYMBOLS)
-    obs = decode_blocks(wave[cursor:], nblocks, cfg, cfg.mod == '2-FSK', equalize=True)[:nsyms]
-    b = (abs(obs[:, 1]) > abs(obs[:, 0])).astype(np.uint8) if cfg.mod == '2-FSK' else decisions(obs, cfg.mod)
-    data = whiten(pack(b[:(PAYLOAD+4)*8]), payload_seed(meta))
+    k = constellation(cfg.mod, cfg)[1]
+    nsyms = math.ceil((cfg.payload_bytes+4)*8/k)
+    nblocks = math.ceil(nsyms/cfg.data_symbols)
+    pilot_quality = []
+    obs = decode_blocks(wave[cursor:], nblocks, cfg, cfg.mod == '2-FSK',
+                        equalize=True, quality=pilot_quality)[:nsyms]
+    b = decisions(obs, cfg.mod, cfg)
+    data = whiten(pack(b[:(cfg.payload_bytes+4)*8]), payload_seed(meta))
     payload = data[:meta.length]
-    valid = zlib.crc32(payload) == int.from_bytes(data[PAYLOAD:PAYLOAD+4], 'big')
-    measured = meta.length*8//k  # Exclude CRC, padding, and a mixed partial symbol.
-    sir_signal, sir_interference = decision_error_energies(obs[:measured], cfg.mod)
+    valid = zlib.crc32(payload) == int.from_bytes(data[cfg.payload_bytes:cfg.payload_bytes+4], 'big')
+    measured = meta.length*8//k
+    sir_signal, sir_interference = decision_error_energies(obs[:measured], cfg.mod, cfg)
+    pilot_signal = sum(row[0] for row in pilot_quality)
+    pilot_error = sum(row[1] for row in pilot_quality)
+    pilot_count = sum(row[2] for row in pilot_quality)
+    crc_signal = crc_error = 0.
+    if valid and measured:
+        # CRC-validated data can be reconstructed locally; no external reference.
+        encoded = whiten(payload.ljust(cfg.payload_bytes,b'\0')+
+                         struct.pack('!I',zlib.crc32(payload)),payload_seed(meta))
+        expected = symbols(encoded,cfg.mod,cfg)[:measured]
+        if cfg.mod == '2-FSK':
+            expected = np.column_stack((expected < 0, expected > 0)).astype(complex)
+        crc_signal,crc_error = vector_energies(obs[:measured],expected)
     return Decoded(meta, payload, valid, obs, cfo, score,
-                   sir_signal, sir_interference, measured)
+                   sir_signal, sir_interference, measured,
+                   pilot_signal,pilot_error,pilot_count,crc_signal,crc_error,
+                   measured if valid else 0)
 
 
 class StreamDecoder:
@@ -359,8 +393,8 @@ class StreamDecoder:
         cfg.validate()
         self.cfg = cfg
         self.buffer = np.empty(0, np.complex64)
-        self.prefix_len = len(PREAMBLE) if cfg.preamble else 0
-        self.sync = PREAMBLE[:len(SYNC)] if cfg.preamble else SYNC
+        self.prefix_len = len(preamble_wave(cfg))
+        self.sync = preamble_wave(cfg)[:64*SPS] if cfg.preamble else sync_wave(cfg)
         self.length = frame_len(cfg) + self.prefix_len
         self.header_failures = 0
         self.candidates = 0
@@ -405,7 +439,7 @@ class StreamDecoder:
             positions = min(len(self.buffer)-self.length+1, 32768)
             segment = self.buffer[:positions+len(short)-1]
             energy = np.convolve(abs(segment)**2, np.ones(len(short)), 'valid')
-            denom = np.maximum(energy*len(short), 1e-15)
+            denom = np.maximum(energy*float(np.vdot(short, short).real), 1e-15)
             # FFT roundoff over exact silence must not win normalized correlation.
             energetic = energy > max(float(energy.max())*1e-6, 1e-15)
             if not np.any(energetic):

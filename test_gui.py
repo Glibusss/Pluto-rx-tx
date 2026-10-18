@@ -8,6 +8,55 @@ from modem import Config
 
 
 class GuiTests(unittest.TestCase):
+    def test_real_windows_build_with_requested_tabs_and_adaptive_profiles(self):
+        from tx_emitter import EmitterApp
+        from modulations import MODS
+        for tx in (False, True):
+            app=App(tx)
+            try:
+                app.withdraw()
+                app.update_idletasks()
+                self.assertEqual([app.top_tabs.tab(t,'text') for t in app.top_tabs.tabs()],
+                                 ['Выбор данных, выбор устройства','Настройки'])
+                self.assertEqual([app.tabs.tab(t,'text') for t in app.tabs.tabs()],
+                                 ['Принятые данные','Статистика','Спектр','Решения демодулятора','Лог'])
+                for tab in app.top_tabs.tabs():
+                    self.assertLessEqual(app.nametowidget(tab).winfo_reqheight(),int(app.top_tabs.cget('height')))
+                from modem import make_frame, decode_frame, preamble_wave
+                from session import Source, Reception
+                from spectrum import calculate_spectrum
+                import numpy as np
+                cfg=Config()
+                source=Source.text('Проверка принятого текста')
+                packet=decode_frame(make_frame(source.meta(81,0),source.payload(0),cfg)[len(preamble_wave(cfg)):],cfg,0)
+                reception=Reception(packet.meta,None,cfg.mod)
+                reception.accept(packet)
+                app.update_snapshot(reception.snapshot())
+                self.assertIn('Проверка принятого текста',app.received_text.get('1.0','end'))
+                frequency,power=calculate_spectrum(np.ones(512),1000000,2400000000)
+                app.spectrum_trace=dict(frequency=frequency,power=power,signal_frequency=2400000000)
+                app.draw_spectrum()
+                self.assertGreater(len(app.spectrum_canvas.find_all()),10)
+                for mod in MODS:
+                    app.mod.set(mod)
+                    app.update_idletasks()
+                    self.assertEqual(app.settings()['cfg'].mod,mod)
+            finally:
+                app.destroy()
+        app=EmitterApp()
+        try:
+            app.withdraw()
+            for mod in MODS:
+                app.phy.mod.set(mod)
+                app.update_idletasks()
+                cfg=app.settings()
+                self.assertEqual(cfg.modem_config().mod,mod)
+            app.signal_mode.set('noise')
+            app.update_modes()
+            self.assertEqual(str(app.mod_widget.cget('state')),'disabled')
+        finally:
+            app.destroy()
+
     def test_custom_radio_icon_replaces_default_tk_feather(self):
         pixels=app_icon_pixels()
         self.assertEqual((len(pixels),len(pixels[0])),(32,32))
@@ -25,6 +74,7 @@ class GuiTests(unittest.TestCase):
                     freq='2400',gap='20',queue_buffers='512',uri='usb:1.2.3',
                     folder='received',tx_amplitude='4096')
         app=SimpleNamespace(tx=True,environment_dbfs=None,receiver_noise_dbfs=None,
+                            phy=Mock(config=Mock(return_value=Config())),
                             **{name:Mock(get=Mock(return_value=value)) for name,value in values.items()})
         settings=App.settings(app)
         self.assertEqual(settings['cfg'],Config())

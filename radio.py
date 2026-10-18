@@ -16,7 +16,8 @@ import traceback
 from pathlib import Path
 import numpy as np
 from scipy.stats import f as fisher_f, norm
-from modem import Config, SPS, make_frame, StreamDecoder
+from modem import Config, SPS, PHY_VERSION, make_frame, StreamDecoder
+from spectrum import calculate_spectrum
 from session import Reception
 
 
@@ -34,7 +35,7 @@ NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
 RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
-PROCESSING_REVISION = 'pilot-timing-fft-v2'
+PROCESSING_REVISION = 'selected-modulation-profile-v3'
 
 
 def read_rx_buffer(sdr):
@@ -131,7 +132,7 @@ def configure_tx_packet_path(sdr, sample_rate):
 
 def experiment_settings(settings, sdr=None, tx=False):
     """Serializable requested settings and hardware values actually read back."""
-    result = dict(processing_revision=PROCESSING_REVISION, phy_version=1,
+    result = dict(processing_revision=PROCESSING_REVISION, phy_version=PHY_VERSION,
                   cfg=asdict(settings['cfg']), samples_per_symbol=SPS,
                   payload_fec=False, header_decoder='hard-majority',
                   adc_full_scale=ADC_FULL_SCALE)
@@ -365,6 +366,8 @@ def transmit(settings, source, stop, emit):
     size=None
     try:
         cfg=settings['cfg']
+        cfg.validate()
+        source=source.with_payload(cfg.payload_bytes)
         amplitude=tx_amplitude(settings)
         sdr=connect(settings,True)
         emit('log',f'Pluto подключён. TX LO={int(sdr.tx_lo)} Гц, Fs={int(sdr.sample_rate)}')
@@ -478,6 +481,7 @@ def receive(settings, reference, folder, stop, emit):
         if threshold_dbfs is not None:
             emit('log',f'Порог эфирного фона включён: {float(threshold_dbfs):.1f} dBFS.')
         def collect():
+            last_spectrum=-float('inf')
             offset=0
             gap=None
             tail=0
@@ -519,6 +523,14 @@ def receive(settings, reference, folder, stop, emit):
                             break
                         continue
                     raw=np.asarray(raw,np.complex64)
+                    now=time.monotonic()
+                    if len(raw)>=16 and now-last_spectrum>=RX_SNAPSHOT_INTERVAL:
+                        center=int(getattr(sdr,'rx_lo',settings.get('frequency',0)-settings['cfg'].sample_rate//4))
+                        frequency,power=calculate_spectrum(raw[:4096],settings['cfg'].sample_rate,center)
+                        emit('spectrum',dict(frequency=frequency,power=power,
+                                            signal_frequency=settings.get('frequency',center),
+                                            sample_rate=settings['cfg'].sample_rate))
+                        last_spectrum=now
                     # fs/4 oscillator has exactly four states, no growing float phase.
                     iq=raw*rx_mixer(len(raw),offset)
                     offset=(offset+len(raw))%4

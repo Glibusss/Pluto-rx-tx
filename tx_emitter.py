@@ -8,7 +8,8 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from hackrf_emitter import (EmitterConfig, HACKRF_SAMPLE_RATES, MODS,
+from phy_settings import PhySettings
+from hackrf_emitter import (EmitterConfig, HACKRF_SAMPLE_RATES,
                             discover_hackrf_devices, find_hackrf_transfer,
                             run_transmitter)
 
@@ -17,8 +18,8 @@ class EmitterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('HackRF — TX-излучатель')
-        self.geometry('980x760')
-        self.minsize(820, 680)
+        self.geometry('1180x1030')
+        self.minsize(1100, 950)
         self.events = queue.SimpleQueue()
         self.stop_event = threading.Event()
         self.worker = None
@@ -90,7 +91,6 @@ class EmitterApp(tk.Tk):
         signal = ttk.LabelFrame(main, text='Формирование сигнала', padding=8)
         signal.pack(fill='x', pady=10)
         self.signal_mode = tk.StringVar(value='packet')
-        self.modulation = tk.StringVar(value='BPSK')
         self.packet_kind = tk.StringVar(value='text')
         self.iq_path = tk.StringVar()
         self.iq_format = tk.StringVar(value='CS8 — signed int8 I/Q')
@@ -113,11 +113,6 @@ class EmitterApp(tk.Tk):
                                   value='file', command=self.update_modes)
         iq_file.grid(row=0, column=4, sticky='w', padx=5)
         self.controls += [(packet, 'normal'), (noise, 'normal'), (iq_file, 'normal')]
-        ttk.Label(signal, text='Модуляция кадра').grid(row=1, column=0, sticky='w', padx=5, pady=5)
-        self.mod_widget = ttk.Combobox(signal, textvariable=self.modulation, values=MODS,
-                                       state='readonly', width=18)
-        self.mod_widget.grid(row=1, column=1, sticky='w', padx=5)
-        self.controls.append((self.mod_widget, 'readonly'))
         ttk.Label(signal,text='Содержимое кадра').grid(row=1,column=2,sticky='w',padx=5)
         self.packet_widgets=[]
         for col,(kind,label) in enumerate((('text','Случайный текст'),('image','Красное изображение')),3):
@@ -170,16 +165,26 @@ class EmitterApp(tk.Tk):
         self.off_widget = ttk.Entry(pulse_times, textvariable=self.pulse_off, width=8)
         self.off_widget.pack(side='left', padx=4)
         self.controls += [(self.on_widget, 'normal'), (self.off_widget, 'normal')]
+        self.phy=PhySettings(signal,self.controls)
+        self.phy.grid(row=5,column=0,columnspan=5,sticky='ew',pady=5)
+        self.modulation=self.phy.mod
+        self.mod_widget=self.phy.mod_widget
+        self.packet_rate=tk.StringVar(value='2')
+        ttk.Label(signal,text='Частота дискретизации профиля RX, MS/s').grid(row=6,column=0,columnspan=2,sticky='w',padx=5)
+        rate=ttk.Combobox(signal,textvariable=self.packet_rate,values=('1','2'),state='readonly',width=6)
+        rate.grid(row=6,column=2,sticky='w',padx=5)
+        self.packet_rate_widget=rate
+        self.controls.append((rate,'readonly'))
         ttk.Label(signal, text=(
-            'Кадры: случайный текст при каждом Start или красное RGB 16×16. '
-            'Для приёма кадров: Pluto, 2 MS/s, та же модуляция, преамбула включена, CP выключен. '
+            'Кадры: случайный текст при каждом Start или красный RGB-блок выбранного размера. '
+            'Для приёма кадров профиль RX должен полностью совпадать с выбранным профилем. '
             'Полоса — до sample rate. Амплитуда выше 100% допускает насыщение CS8. В режиме шума '
             'фиксированный сигнал заполняет полосу; при сканировании узкая шумовая полоса '
             'проходит по всей заданной полосе. В импульсном сканировании каждый импульс '
             'выполняет один полный проход; поле периода относится к непрерывному режиму. '
             'Для IQ-файла sample rate берётся из RF-параметров, а не из метаданных файла.'),
             wraplength=880, justify='left').grid(
-                row=5, column=0, columnspan=5, sticky='w', padx=5, pady=(8, 0))
+                row=7, column=0, columnspan=5, sticky='w', padx=5, pady=(8, 0))
 
         run = ttk.Frame(main)
         run.pack(fill='x')
@@ -269,6 +274,8 @@ class EmitterApp(tk.Tk):
             amplitude=self._number(self.amplitude.get()) / 100,
             signal_mode=self.signal_mode.get(), modulation=self.modulation.get(),
             packet_kind=self.packet_kind.get(),
+            packet_config=self.phy.config(int(self._number(self.packet_rate.get())*1e6))
+                          if self.signal_mode.get()=='packet' else None,
             tuning_mode=self.tuning_mode.get(), operation_mode=self.operation_mode.get(),
             sweep_period_ms=self._number(self.sweep_period.get()),
             pulse_on_ms=self._number(self.pulse_on.get()),
@@ -283,7 +290,8 @@ class EmitterApp(tk.Tk):
         running = self.worker is not None and self.worker.is_alive()
         if running:
             return
-        self.mod_widget.configure(state='readonly' if self.signal_mode.get() == 'packet' else 'disabled')
+        self.phy.set_enabled(self.signal_mode.get()=='packet')
+        self.packet_rate_widget.configure(state='readonly' if self.signal_mode.get()=='packet' else 'disabled')
         for widget in self.packet_widgets:
             widget.configure(state='normal' if self.signal_mode.get()=='packet' else 'disabled')
         file_state = self.signal_mode.get() == 'file'

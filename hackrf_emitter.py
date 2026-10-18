@@ -22,7 +22,8 @@ import time
 import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
 
-from modem import Config, MODS, PAYLOAD, PREAMBLE, frame_len, make_frame
+from modem import Config, frame_len, make_frame, preamble_wave, tile_shape
+from modulations import MODS
 from session import Source
 
 
@@ -220,6 +221,14 @@ class EmitterConfig:
     serial: str = ''
     executable: str = 'hackrf_transfer'
     packet_kind: str = 'text'
+    packet_config: Config | None = None
+
+    def modem_config(self):
+        cfg = self.packet_config or Config(self.modulation, True, False, PACKET_RATE)
+        cfg.validate()
+        if cfg.mod != self.modulation:
+            raise ValueError('Модуляция профиля не совпадает с модуляцией кадра')
+        return cfg
 
     def validate(self):
         if not HACKRF_MIN_FREQUENCY <= self.frequency_hz <= HACKRF_MAX_FREQUENCY:
@@ -244,6 +253,8 @@ class EmitterConfig:
             iq_file_sample_count(self)
         if self.modulation not in MODS:
             raise ValueError('Неизвестная модуляция')
+        if self.signal_mode == 'packet':
+            self.modem_config()
         if self.packet_kind not in PACKET_KINDS:
             raise ValueError('Содержимое кадра: текст или изображение')
         if self.tuning_mode not in TUNING_MODES:
@@ -279,8 +290,9 @@ def _active_sample_count(cfg: EmitterConfig) -> int:
         duration_ms = 100.0
     samples = _sample_count(cfg.sample_rate, duration_ms, 1)
     if cfg.signal_mode=='packet' and cfg.operation_mode=='continuous' and cfg.tuning_mode=='fixed':
-        packet_samples=(len(PREAMBLE)+frame_len(Config(cfg.modulation,True,False,PACKET_RATE)))
-        packet_samples=packet_samples*cfg.sample_rate//PACKET_RATE
+        profile=cfg.modem_config()
+        packet_samples=len(preamble_wave(profile))+frame_len(profile)
+        packet_samples=packet_samples*cfg.sample_rate//profile.sample_rate
         samples=((samples+packet_samples-1)//packet_samples)*packet_samples
     return samples
 
@@ -330,21 +342,27 @@ def load_iq_file(path: str | Path, iq_format: str) -> np.ndarray:
 
 
 def packet_source(cfg: EmitterConfig) -> Source:
+    profile = cfg.modem_config()
+    size = profile.payload_bytes
     if cfg.packet_kind=='image':
-        return Source(1,bytes((255,0,0))*(16*16),16,16,'Красное изображение HackRF 16×16')
-    return Source.text(secrets.token_hex(PAYLOAD//2),'Случайный текст HackRF')
+        width, height = tile_shape(size)
+        return Source(1,bytes((255,0,0))*(width*height),width,height,
+                      f'Красное изображение HackRF {width}×{height}',size)
+    return Source.text(secrets.token_hex((size+1)//2)[:size],
+                       'Случайный текст HackRF',payload_bytes=size)
 
 
 def _packet_template(cfg: EmitterConfig, source=None, transfer=None) -> np.ndarray:
     """Return one real frame made by the existing project modem."""
     source = source if source is not None else packet_source(cfg)
     transfer = secrets.randbits(64) if transfer is None else transfer
-    modem_cfg = Config(cfg.modulation, True, False, PACKET_RATE)
+    modem_cfg = cfg.modem_config()
+    source = source.with_payload(modem_cfg.payload_bytes)
     frame = make_frame(source.meta(transfer, 0), source.payload(0), modem_cfg)
-    if cfg.sample_rate != PACKET_RATE:
-        divisor = math.gcd(cfg.sample_rate, PACKET_RATE)
+    if cfg.sample_rate != modem_cfg.sample_rate:
+        divisor = math.gcd(cfg.sample_rate, modem_cfg.sample_rate)
         frame = resample_poly(frame, cfg.sample_rate // divisor,
-                              PACKET_RATE // divisor).astype(np.complex64)
+                              modem_cfg.sample_rate // divisor).astype(np.complex64)
     peak = float(np.max(np.abs(frame)))
     return (frame / max(peak, 1e-9)).astype(np.complex64)
 
@@ -626,6 +644,7 @@ def run_transmitter(cfg: EmitterConfig, stop: threading.Event, emit):
         source=packet_source(cfg) if cfg.signal_mode=='packet' else None
         transfer=secrets.randbits(64) if source is not None else None
         if source is not None:
+            emit('log',f'Профиль приёмника: {cfg.modem_config()}')
             emit('log',f'Кадр {transfer:016x}: '+source.label+'. DATA №0 повторяется до Stop; END не отправляется.')
             if not source.kind:
                 emit('log','Текст кадра: '+source.raw.decode('utf-8'))

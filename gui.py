@@ -11,7 +11,8 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from PIL import Image, ImageTk
-from modem import Config, MODS, frame_len, PREAMBLE
+from modem import frame_len, preamble_wave
+from phy_settings import PhySettings
 from session import Source
 from radio import (RX_QUEUE_DEFAULT, TX_AMPLITUDE_DEFAULT, calibrate_noise,
                    discover_pluto_usb, receive, rx_queue_capacity, transmit, tx_amplitude)
@@ -71,8 +72,8 @@ class App(tk.Tk):
         self.iconphoto(True,self.app_icon)
         self.tx=tx
         self.title('PlutoSDR — '+('Передатчик' if tx else 'Приёмник / BER / PER'))
-        self.geometry('1200x850')
-        self.minsize(900,700)
+        self.geometry('1200x950')
+        self.minsize(1100,850)
         self.events=queue.SimpleQueue()
         self.latest={}
         self.latest_lock=threading.Lock()
@@ -99,11 +100,14 @@ class App(tk.Tk):
     def build(self):
         main=ttk.Frame(self,padding=10)
         main.pack(fill='both',expand=True)
-        rf=ttk.LabelFrame(main,text='Параметры радио — должны совпадать на TX и RX',padding=8)
-        rf.pack(fill='x')
+        self.top_tabs=ttk.Notebook(main,height=390)
+        self.top_tabs.pack(fill='x')
+        data_page=ttk.Frame(self.top_tabs,padding=6)
+        settings_page=ttk.Frame(self.top_tabs,padding=6)
+        self.top_tabs.add(data_page,text='Выбор данных, выбор устройства')
+        self.top_tabs.add(settings_page,text='Настройки')
         self.uri=tk.StringVar(value='ip:192.168.2.1')
         self.freq=tk.StringVar(value='2400')
-        self.mod=tk.StringVar(value='BPSK')
         self.rate=tk.StringVar(value='1')
         self.gain=tk.StringVar(value='-10' if self.tx else '20')
         self.tx_amplitude=tk.StringVar(value=f'{TX_AMPLITUDE_DEFAULT:g}')
@@ -115,57 +119,36 @@ class App(tk.Tk):
         self.squelch_threshold=tk.StringVar(value='')
         self.environment_level=tk.StringVar(value='Фон и помехи: —')
         self.receiver_noise_level=tk.StringVar(value='Шум приёмника: —')
-        self.pre=tk.BooleanVar(value=True)
-        self.cp=tk.BooleanVar(value=False)
-        entries=[('URI Pluto',self.uri,24),('Частота центра, МГц',self.freq,13),
-                 ('TX gain Pluto, dB (≤0)' if self.tx else 'RX gain Pluto, dB',self.gain,12)]
-        for col,(label,var,width) in enumerate(entries):
+        device=ttk.LabelFrame(data_page,text='Устройство Pluto',padding=6)
+        device.pack(fill='x')
+        ttk.Label(device,text='URI Pluto').pack(side='left',padx=4)
+        self.uri_widget=ttk.Combobox(device,textvariable=self.uri,width=35,state='normal')
+        self.uri_widget.pack(side='left',fill='x',expand=True,padx=4)
+        self.discovery_button=ttk.Button(device,text='Найти USB',command=self.find_pluto)
+        self.discovery_button.pack(side='left',padx=4)
+        self.controls.extend([(self.uri_widget,'normal'),(self.discovery_button,'normal')])
+        rf=ttk.LabelFrame(settings_page,text='Радио',padding=5)
+        rf.pack(fill='x')
+        fields=[('Центр, МГц',self.freq),('TX gain, dB' if self.tx else 'RX gain, dB',self.gain)]
+        for col,(label,var) in enumerate(fields):
             ttk.Label(rf,text=label).grid(row=0,column=col*2,sticky='w',padx=4)
-            parent=rf
-            if var is self.uri or var is self.gain:
-                parent=ttk.Frame(rf)
-                parent.grid(row=0,column=col*2+1,padx=4,sticky='ew')
-            if var is self.uri:
-                w=ttk.Combobox(parent,textvariable=var,width=width,state='normal')
-                w.pack(side='left',fill='x',expand=True)
-                self.uri_widget=w
-                self.discovery_button=ttk.Button(parent,text='Найти USB',command=self.find_pluto)
-                self.discovery_button.pack(side='left',padx=(7,0))
-                self.controls.append((self.discovery_button,'normal'))
-            else:
-                w=ttk.Entry(parent,textvariable=var,width=width)
-            if var is self.gain:
-                w.pack(side='left')
-                ttk.Label(parent,textvariable=self.gain_info).pack(side='left',padx=(7,0))
-            elif var is not self.uri:
-                w.grid(row=0,column=col*2+1,padx=4,sticky='ew')
-            self.controls.append((w,'normal'))
+            widget=ttk.Entry(rf,textvariable=var,width=10)
+            widget.grid(row=0,column=col*2+1,padx=4)
+            self.controls.append((widget,'normal'))
+        ttk.Label(rf,textvariable=self.gain_info).grid(row=0,column=4,padx=4)
         self.gain.trace_add('write',self.update_gain_info)
-        ttk.Label(rf,text='Модуляция').grid(row=1,column=0,sticky='w',padx=4,pady=8)
-        w=ttk.Combobox(rf,textvariable=self.mod,values=MODS,state='readonly',width=20)
-        w.grid(row=1,column=1,sticky='ew',padx=4)
-        self.controls.append((w,'readonly'))
-        ttk.Label(rf,text='Sample rate, MS/s').grid(row=1,column=2,sticky='w',padx=4)
-        w=ttk.Combobox(rf,textvariable=self.rate,values=('1','2'),state='readonly',width=10)
-        w.grid(row=1,column=3,sticky='ew',padx=4)
-        self.controls.append((w,'readonly'))
-        label='Пауза после буфера, мс' if self.tx else 'Поиск CFO ± Гц'
-        ttk.Label(rf,text=label).grid(row=1,column=4,sticky='w',padx=4)
-        w=ttk.Entry(rf,textvariable=self.gap if self.tx else self.cfo,width=12)
-        w.grid(row=1,column=5,sticky='ew',padx=4)
-        self.controls.append((w,'normal'))
+        ttk.Label(rf,text='MS/s').grid(row=0,column=5,padx=4)
+        widget=ttk.Combobox(rf,textvariable=self.rate,values=('1','2'),state='readonly',width=5)
+        widget.grid(row=0,column=6,padx=4)
+        self.controls.append((widget,'readonly'))
         options=ttk.Frame(rf)
-        options.grid(row=2,column=0,columnspan=6,sticky='w')
-        for label,var in [('Преамбула',self.pre),('Циклический префикс: 16 символов',self.cp)]:
-            w=ttk.Checkbutton(options,text=label,variable=var)
-            w.pack(side='left',padx=5)
-            self.controls.append((w,'normal'))
-        if not self.tx:
-            ttk.Label(options,text='IQ очередь, буферов:').pack(side='left',padx=(12,4))
-            w=ttk.Entry(options,textvariable=self.queue_buffers,width=7)
-            w.pack(side='left')
-            self.controls.append((w,'normal'))
-        ttk.Label(options,text='Заголовок BPSK; RGB-блок 16×16; пилоты в каждом блоке').pack(side='left',padx=12)
+        options.grid(row=1,column=0,columnspan=7,sticky='w',pady=4)
+        fields=[('Пауза TX, мс',self.gap)] if self.tx else [('Поиск CFO ± Гц',self.cfo),('IQ очередь, буферов',self.queue_buffers)]
+        for label,var in fields:
+            ttk.Label(options,text=label).pack(side='left',padx=4)
+            widget=ttk.Entry(options,textvariable=var,width=10)
+            widget.pack(side='left',padx=4)
+            self.controls.append((widget,'normal'))
         if self.tx:
             amplitude=ttk.Frame(rf)
             amplitude.grid(row=3,column=0,columnspan=6,sticky='w',pady=(7,0))
@@ -197,8 +180,13 @@ class App(tk.Tk):
             self.controls.append((w,'normal'))
             ttk.Label(noise,text='Требуется согласованная заглушка 50 Ω на RX').pack(side='left',padx=(8,4))
             ttk.Label(noise,textvariable=self.receiver_noise_level).pack(side='left',padx=8)
-        src=ttk.LabelFrame(main,text='Данные для передачи' if self.tx else 'Эталон — тот же файл или точно тот же текст, что на TX',padding=8)
-        src.pack(fill='both',expand=True,pady=8)
+        self.phy=PhySettings(settings_page,self.controls)
+        self.phy.pack(fill='x',pady=(5,0))
+        self.mod=self.phy.mod
+        self.pre=self.phy.preamble
+        self.cp=self.phy.cp
+        src=ttk.LabelFrame(data_page,text='Данные для передачи' if self.tx else 'Эталон для BER — необязательно',padding=6)
+        src.pack(fill='both',expand=True,pady=5)
         self.kind=tk.StringVar(value='image')
         top=ttk.Frame(src)
         top.pack(fill='x')
@@ -219,13 +207,15 @@ class App(tk.Tk):
         text_area.pack(fill='both',expand=True,pady=(3,0))
         text_area.columnconfigure(0,weight=1)
         text_area.rowconfigure(0,weight=1)
-        self.text=tk.Text(text_area,height=8,wrap='word',font=('Consolas',10),undo=True)
+        self.text=tk.Text(text_area,height=4,wrap='word',font=('Consolas',10),undo=True)
         text_scroll=ttk.Scrollbar(text_area,orient='vertical',command=self.text.yview)
         self.text.configure(yscrollcommand=text_scroll.set)
         self.text.grid(row=0,column=0,sticky='nsew')
         text_scroll.grid(row=0,column=1,sticky='ns')
         self.text.bind('<FocusIn>',self.select_text_input)
         self.controls.append((self.text,'normal'))
+        self.left=ttk.Label(data_page,text='Исходное изображение / эталон',anchor='center')
+        self.left.pack(fill='x',pady=3)
         run=ttk.Frame(main)
         run.pack(fill='x')
         self.start_btn=ttk.Button(run,text='Start TX' if self.tx else 'Start RX',command=self.start)
@@ -246,41 +236,48 @@ class App(tk.Tk):
         w=ttk.Button(dst,text='Папка…',command=self.pick_folder)
         w.pack(side='left')
         self.controls.append((w,'normal'))
-        self.metrics=ttk.Label(main,text='BER: —    PER: —    SNR: —    SIR: —',font=('Segoe UI',11),wraplength=1140)
-        self.metrics.pack(fill='x',pady=8)
         self.tabs=ttk.Notebook(main)
-        self.tabs.pack(fill='both',expand=True)
-        image_tab=ttk.Frame(self.tabs)
-        self.tabs.add(image_tab,text='Изображение / текст')
-        self.left=ttk.Label(image_tab,text='Исходное изображение / эталон',anchor='center')
-        self.left.pack(side='left',fill='both',expand=True)
-        self.right=ttk.Label(image_tab,text='Принятое изображение',anchor='center')
-        if not self.tx:
-            self.right.pack(side='left',fill='both',expand=True)
+        self.tabs.pack(fill='both',expand=True,pady=(8,0))
         received_tab=ttk.Frame(self.tabs)
-        received_tab.columnconfigure(0,weight=1)
         received_tab.rowconfigure(0,weight=1)
-        self.received_text=tk.Text(received_tab,wrap='word',state='disabled',font=('Consolas',11))
-        received_scroll=ttk.Scrollbar(received_tab,orient='vertical',command=self.received_text.yview)
+        received_tab.columnconfigure(0,weight=1)
+        self.tabs.add(received_tab,text='Принятые данные')
+        self.right=ttk.Label(received_tab,text='Ожидание изображения' if not self.tx else 'Результат отображается в приёмнике',anchor='center')
+        self.right.grid(row=0,column=0,sticky='nsew')
+        self.received_panel=ttk.Frame(received_tab)
+        self.received_panel.grid(row=0,column=0,sticky='nsew')
+        self.received_panel.rowconfigure(0,weight=1)
+        self.received_panel.columnconfigure(0,weight=1)
+        self.received_text=tk.Text(self.received_panel,wrap='word',state='disabled',font=('Consolas',11))
+        received_scroll=ttk.Scrollbar(self.received_panel,orient='vertical',command=self.received_text.yview)
         self.received_text.configure(yscrollcommand=received_scroll.set)
         self.received_text.grid(row=0,column=0,sticky='nsew')
         received_scroll.grid(row=0,column=1,sticky='ns')
-        self.tabs.add(received_tab,text='Принятый текст')
+        self.received_panel.grid_remove()
+        statistics_tab=ttk.Frame(self.tabs)
+        self.tabs.add(statistics_tab,text='Статистика')
+        self.metrics=ttk.Label(statistics_tab,text='BER: —    PER: —    Потеряно пикселей: —    Искажено битов: —',font=('Segoe UI',11),wraplength=1140)
+        self.metrics.pack(fill='x',pady=8)
+        self.packet_canvas=tk.Canvas(statistics_tab,bg='white',highlightthickness=0)
+        self.packet_canvas.pack(fill='both',expand=True)
+        self.spectrum_canvas=tk.Canvas(self.tabs,bg='#10151c',highlightthickness=0)
+        self.tabs.add(self.spectrum_canvas,text='Спектр')
+        self.spectrum_trace=None
+        self.spectrum_canvas.bind('<Configure>',lambda e:self.draw_spectrum())
+        self.draw_spectrum()
         self.plot=tk.Canvas(self.tabs,bg='white',highlightthickness=0)
         self.tabs.add(self.plot,text='Решения демодулятора')
-        self.packet_canvas=tk.Canvas(self.tabs,bg='white',highlightthickness=0)
-        self.tabs.add(self.packet_canvas,text='Пакеты')
         self.log=tk.Text(self.tabs,height=8,wrap='word',state='disabled',font=('Consolas',10))
         self.tabs.add(self.log,text='Лог')
         self.plot.bind('<Configure>',lambda e:self.draw_plots())
         self.packet_canvas.bind('<Configure>',lambda e:self.draw_plots())
-        self.write_log('Первым запустите RX. Затем отправьте данные с TX. Настройки фиксируются до Stop.')
+        self.write_log('Первым запустите RX. Затем TX. Весь профиль сигнала должен совпадать; настройки фиксируются до Stop.')
 
     def load_image(self):
         path=filedialog.askopenfilename(filetypes=[('Изображения','*.png *.jpg *.jpeg'),('Все файлы','*.*')])
         if not path:return
         try:
-            self.source=Source.image(path)
+            self.source=Source.image(path,int(self.phy.payload_bytes.get()))
             self.kind.set('image')
             self.source_label.configure(text=(f'{self.source.label}: {self.source.width}×{self.source.height}, '
                 f'{self.source.total} пакетов, SHA {self.source.digest.hex()[:8]}'))
@@ -327,14 +324,15 @@ class App(tk.Tk):
 
     def show_image(self,label,im,key):
         im=im.copy()
-        im.thumbnail((530,410))
+        im.thumbnail((530,120) if key=='left' else (1050,450))
         self.photo_refs[key]=ImageTk.PhotoImage(im)
         label.configure(image=self.photo_refs[key],text='')
 
     def get_source(self):
-        if self.kind.get()=='image':return self.source
+        if self.kind.get()=='image':
+            return self.source.with_payload(int(self.phy.payload_bytes.get())) if self.source else None
         value=self.text.get('1.0','end-1c')
-        return Source.text(value) if value else None
+        return Source.text(value,payload_bytes=int(self.phy.payload_bytes.get())) if value else None
 
     def reset_received_text(self,transfer=None):
         self.received_transfer=transfer
@@ -348,7 +346,7 @@ class App(tk.Tk):
         self.received_text.configure(state='disabled')
 
     def settings(self,include_squelch=True):
-        cfg=Config(self.mod.get(),self.pre.get(),self.cp.get(),int(float(self.rate.get())*1e6),float(self.cfo.get()))
+        cfg=self.phy.config(int(float(self.rate.get())*1e6),float(self.cfo.get()))
         cfg.validate()
         gain=float(self.gain.get())
         if not (-89.75<=gain<=0 if self.tx else -3<=gain<=71):
@@ -428,6 +426,8 @@ class App(tk.Tk):
             messagebox.showerror('Параметры',str(e));return
         self.stop_event.clear()
         self.output=None
+        self.spectrum_trace=None
+        self.draw_spectrum()
         if not self.tx:self.reset_received_text()
         for widget,state in self.controls:widget.configure(state='disabled')
         self.start_btn.configure(state='disabled')
@@ -442,7 +442,7 @@ class App(tk.Tk):
         if not self.tx:
             self.write_log('Для измерений запускайте RX до TX. Потеря №0 не прерывает приём №1 и следующих пакетов.')
         if self.tx:
-            duration=(frame_len(cfg)+(len(PREAMBLE) if cfg.preamble else 0))/cfg.sample_rate
+            duration=(frame_len(cfg)+len(preamble_wave(cfg)))/cfg.sample_rate
             self.write_log(f'Радиопакет ≈{duration*1000:.1f} мс. Одинаковая Rs и средняя энергия символа; не одинаковая Eb/N0.')
         def work():
             try:
@@ -455,7 +455,7 @@ class App(tk.Tk):
         self.worker.start()
 
     def emit(self,kind,value):
-        if kind in ('snapshot','health','progress'):
+        if kind in ('snapshot','health','progress','spectrum'):
             with self.latest_lock:self.latest[kind]=value
         else:self.events.put((kind,value))
 
@@ -482,6 +482,9 @@ class App(tk.Tk):
             self.latest={}
         for kind,value in latest.items():
             if kind=='snapshot':self.update_snapshot(value)
+            elif kind=='spectrum':
+                self.spectrum_trace=value
+                self.draw_spectrum()
             elif kind=='progress':
                 self.progress.configure(value=value[0],maximum=value[1])
                 cycle=value[2] if len(value)>2 else 1
@@ -553,6 +556,7 @@ class App(tk.Tk):
                 for widget,state in self.controls:widget.configure(state=state)
                 if self.discovery_worker and self.discovery_worker.is_alive():
                     self.discovery_button.configure(state='disabled')
+                self.phy.update_modulation()
                 self.start_btn.configure(state='normal')
                 self.stop_btn.configure(state='disabled')
                 self.status.configure(text='Остановлено')
@@ -566,15 +570,25 @@ class App(tk.Tk):
         self.metrics.configure(text=(f'BER: {number(s["ber"])}  (проверено {s["ber_coverage"]:.1%} бит)     '
             f'PER: {s["per"]:.4f}'+(' [итог]' if s['per_final'] else ' [предварительно]')+
             f'     SNR-оценка: {number(s["snr_estimate_db"])} dB'
-            f'     SIR-оценка: {number(s["sir_estimate_db"])} dB\n'
+            f'     SINR по пилотам: {number(s["sinr_estimate_db"])} dB\n'
+            f'EVM пилотов: {number(s["pilot_evm_percent"])}%   EVM данных с верной CRC: {number(s["crc_payload_evm_percent"])}% '
+            f'(охват {s["crc_quality_packet_coverage"]:.1%} принятых пакетов)\n'
             f'GOOD: {s["good_packets"]}   CRC: {s["crc_packets"]}   '
             f'{"LOST" if s["per_final"] else "Ожидаются / потеряны"}: {s["missing_packets"]}   '
-            f'Всего: {s["expected_packets"]}   CFO: {s["last_cfo_hz"]:.0f} Гц'+
-            ('' if s['reference_match'] else f'\nBER/SNR недоступны: {s["reference_status"]}')))
+            f'Всего: {s["expected_packets"]}   CFO: {s["last_cfo_hz"]:.0f} Гц\n'
+            f'{"Потеряно" if s["per_final"] else "Ожидаются / потеряны"} пикселей: {number(s["lost_pixels"])}   '
+            f'Искажено пикселей: {number(s["corrupted_pixels"])}   '
+            f'Искажено битов: {number(s["corrupted_bits"])}'+
+            ('' if s['reference_match'] else f'\nBER/SNR по эталону недоступны: {s["reference_status"]}')+
+            (f'\n{s["quality_warning"]}' if s['quality_warning'] else '')))
         self.progress.configure(maximum=s['expected_packets'],value=s['received_packets'])
         if s['kind']=='RGB':
+            self.received_panel.grid_remove()
+            self.right.grid()
             self.show_image(self.right,Image.frombytes('RGB',(s['width'],s['height']),snapshot['data']),'right')
         else:
+            self.right.grid_remove()
+            self.received_panel.grid()
             # Append newly received bytes immediately. The incremental decoder keeps
             # UTF-8 characters intact when a packet boundary falls inside a character.
             transfer=s['transfer']
@@ -595,6 +609,36 @@ class App(tk.Tk):
             self.received_bytes=preview_size
             self.received_final=self.received_final or final
         self.draw_plots()
+
+    def draw_spectrum(self):
+        c=self.spectrum_canvas
+        c.delete('all')
+        w,h=max(c.winfo_width(),300),max(c.winfo_height(),200)
+        if self.spectrum_trace is None:
+            c.create_text(25,25,anchor='nw',fill='#ddd',text='Спектр появится после Start RX; декодирование пакетов не требуется.')
+            return
+        trace=self.spectrum_trace
+        frequency=np.asarray(trace['frequency'])/1e6
+        db=10*np.log10(np.maximum(trace['power'],1e-20))
+        left,right,top,bottom=65,w-20,35,h-40
+        sx=lambda x:left+(x-frequency[0])/(frequency[-1]-frequency[0])*(right-left)
+        sy=lambda y:bottom-(np.clip(y,-150,10)+150)/160*(bottom-top)
+        for y in range(-140,1,20):
+            c.create_line(left,sy(y),right,sy(y),fill='#28323d')
+            c.create_text(left-7,sy(y),text=str(y),anchor='e',fill='#bcc8d5')
+        for x in np.linspace(frequency[0],frequency[-1],5):
+            c.create_text(sx(x),bottom+18,text=f'{x:.3f}',fill='#bcc8d5')
+        # Preserve narrow peaks when more FFT bins than display points are available.
+        stride=max(1,math.ceil(len(frequency)/1000))
+        padding=(-len(frequency))%stride
+        plot_frequency=np.pad(frequency,(0,padding),mode='edge').reshape(-1,stride).mean(axis=1)
+        plot_db=np.pad(db,(0,padding),constant_values=-200).reshape(-1,stride).max(axis=1)
+        coordinates=[v for x,y in zip(plot_frequency,plot_db) for v in (sx(x),sy(y))]
+        c.create_line(*coordinates,fill='#66d17a',width=1)
+        target=trace['signal_frequency']/1e6
+        if frequency[0]<=target<=frequency[-1]:
+            c.create_line(sx(target),top,sx(target),bottom,fill='#e6ab55',dash=(4,4))
+        c.create_text(left,12,anchor='w',fill='#ddd',text='Принятый спектр · dBFS / FFT bin · частота, МГц · линия: выбранный центр')
 
     def draw_plots(self):
         if not self.output:return
