@@ -418,6 +418,8 @@ class StreamDecoder:
         self._fft_size = None
         self._short_time = np.arange(len(self.short))/cfg.sample_rate
         self._sync_time = np.arange(len(self.sync))/cfg.sample_rate
+        self._sync_ac = self.sync - self.sync.mean()
+        self._sync_ac_energy = float(np.vdot(self._sync_ac, self._sync_ac).real)
 
     def _template_fft(self, freq, size):
         # Cache only the fixed search grid at one FFT size. Locked CFOs may
@@ -427,7 +429,7 @@ class StreamDecoder:
             self._fft_size = size
         cached = self._template_ffts.get(freq)
         if cached is None:
-            template = self.short*np.exp(2j*np.pi*freq*self._short_time)
+            template = (self.short*np.exp(2j*np.pi*freq*self._short_time)).astype(np.complex64)
             cached = fft(template.conj()[::-1], size)
             if freq in self._grid_freqs:
                 self._template_ffts[freq] = cached
@@ -447,7 +449,8 @@ class StreamDecoder:
             # Search only starts for which a whole frame is already present.
             positions = min(len(self.buffer)-self.length+1, 32768)
             segment = self.buffer[:positions+len(short)-1]
-            energy = np.convolve(abs(segment)**2, np.ones(len(short)), 'valid')
+            cumulative = np.r_[0., np.cumsum(abs(segment)**2, dtype=np.float64)]
+            energy = np.maximum(cumulative[len(short):]-cumulative[:-len(short)], 0.)
             denom = np.maximum(energy*float(np.vdot(short, short).real), 1e-15)
             # FFT roundoff over exact silence must not win normalized correlation.
             energetic = energy > max(float(energy.max())*1e-6, 1e-15)
@@ -485,6 +488,19 @@ class StreamDecoder:
                 base = freqs[pos]
                 t = self._sync_time
                 objective = lambda f: -abs(np.vdot(self.sync*np.exp(2j*np.pi*f*t), fragment[:len(self.sync)]))**2
+                if self.cfg.mod == 'ASK / OOK':
+                    # ASK's nonzero mean also correlates with an unrelated carrier.
+                    # Positive ASK levels expose CFO in adjacent sample phases.
+                    # Check the varying prefix before frequency fitting/header decodes.
+                    prefix = fragment[:len(self.sync)]
+                    carrier = np.angle(np.vdot(prefix[:-1], prefix[1:]))*self.cfg.sample_rate/(2*np.pi)
+                    observed = prefix*np.exp(-2j*np.pi*carrier*t)
+                    observed -= observed.mean()
+                    ac_energy = float(np.vdot(observed, observed).real)
+                    covariance = abs(np.vdot(self._sync_ac, observed))**2
+                    if ac_energy <= 1e-15 or covariance < 0.48*ac_energy*self._sync_ac_energy:
+                        self.header_failures += 1
+                        continue
                 fine = minimize_scalar(objective, bounds=(base-step, base+step), method='bounded').x
                 # First maximum can be displaced by one sample after analog filtering.
                 for delta in (0, -1, 1, -2, 2):

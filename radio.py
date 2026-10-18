@@ -36,7 +36,7 @@ RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
 RX_RECEPTION_CACHE_COUNT = 8
 RX_RECEPTION_CACHE_BYTES = 64 * 1024 * 1024
-PROCESSING_REVISION = 'interleaved-rx-baseband-v6'
+PROCESSING_REVISION = 'interleaved-rx-acquisition-v7'
 
 
 def read_rx_buffer(sdr):

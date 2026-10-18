@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import numpy as np
 from scipy.fft import fft, ifft, next_fast_len
 from scipy.signal import correlate
@@ -16,10 +17,48 @@ class ModemTests(unittest.TestCase):
                 spectrum=fft(segment,size)
                 for freq in (decoder.grid[0],0.,decoder.grid[-1],12345.):
                     template=decoder.short*np.exp(2j*np.pi*freq*np.arange(len(decoder.short))/decoder.cfg.sample_rate)
-                    expected=correlate(segment,template,mode='valid',method='fft')
+                    expected=correlate(segment,template.astype(np.complex64),mode='valid',method='fft')
                     actual=ifft(spectrum*decoder._template_fft(freq,size))[
                         len(decoder.short)-1:len(decoder.short)-1+positions]
-                    np.testing.assert_allclose(actual,expected,atol=1e-10,rtol=1e-11)
+                    np.testing.assert_allclose(actual,expected,atol=3e-5,rtol=5e-6)
+
+    def test_ask_carrier_with_noise_does_not_trigger_header_decoding(self):
+        rng=np.random.default_rng(327)
+        count=32768*4
+        time=np.arange(count)/1_000_000
+        noise=.02*(rng.normal(size=count)+1j*rng.normal(size=count))
+        for low in (0.,.5,.9):
+            for cfo in (0.,13_721.):
+                cfg=Config('ASK / OOK',ook_low=low)
+                decoder=StreamDecoder(cfg)
+                wave=32*np.exp(2j*np.pi*cfo*time)+noise
+                with self.subTest(low=low,cfo=cfo),patch('modem.decode_frame',wraps=decode_frame) as decode:
+                    packets=[]
+                    for chunk in np.array_split(wave,4):
+                        packets+=decoder.feed(chunk)
+                    self.assertEqual(packets,[])
+                    decode.assert_not_called()
+
+    def test_ask_nonzero_low_level_decodes_with_cfo_and_noise(self):
+        rng=np.random.default_rng(571)
+        data=rng.integers(0,256,PAYLOAD,dtype=np.uint8).tobytes()
+        for low in (.5,.9):
+            for preamble in (False,True):
+                for cfo in (-39_000.,976.5625,13_721.,39_000.):
+                    cfg=Config('ASK / OOK',preamble=preamble,ook_low=low)
+                    meta=Meta(1,83,0,1,PAYLOAD,16,16,PAYLOAD,b'a'*16)
+                    wave=np.r_[np.zeros(193),make_frame(meta,data,cfg),np.zeros(1000)]
+                    wave=.7*wave*np.exp(1j*(.4+2*np.pi*cfo*np.arange(len(wave))/cfg.sample_rate))
+                    noise=.02 if low==.5 else .002
+                    wave+=noise*(rng.normal(size=len(wave))+1j*rng.normal(size=len(wave)))
+                    decoder=StreamDecoder(cfg)
+                    packets=[]
+                    for chunk in np.array_split(wave,13):
+                        packets+=decoder.feed(chunk)
+                    with self.subTest(low=low,preamble=preamble,cfo=cfo):
+                        self.assertEqual(len(packets),1)
+                        self.assertTrue(packets[0].crc_ok)
+                        self.assertEqual(packets[0].payload,data)
 
     def test_reset_reacquires_different_cfo_and_stream_alignment(self):
         cfg=Config('QAM-16',True,True)
