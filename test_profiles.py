@@ -12,7 +12,7 @@ from hackrf_emitter import EmitterConfig, packet_source, _packet_template
 class ProfileTests(unittest.TestCase):
     def test_selected_modulation_carries_every_service_section(self):
         for mod in MODS:
-            cfg = Config(mod, phase_deg=27, ook_low=.2, fsk_cycles=1.5)
+            cfg = Config(mod, phase_deg=27, ook_low=.2, fsk_deviation_hz=187_500)
             for known in (preamble_wave(cfg), sync_wave(cfg), pilot_wave(cfg)):
                 with self.subTest(mod=mod, samples=len(known)):
                     if mod == '2-FSK':
@@ -30,7 +30,7 @@ class ProfileTests(unittest.TestCase):
         for mod in MODS:
             cfg = Config(mod,True,True,cfo_range=25000,preamble_symbols=96,
                          preamble_seed=478,cp_symbols=8,pilot_symbols=24,pilot_seed=63,
-                         data_symbols=64,payload_bytes=195,phase_deg=23,ook_low=.2,fsk_cycles=1.5)
+                         data_symbols=64,payload_bytes=195,phase_deg=23,ook_low=.2,fsk_deviation_hz=187_500)
             source = Source.text('Профиль '+mod+' АБВ'*45,payload_bytes=cfg.payload_bytes)
             frames = [make_frame(source.meta(148,i),source.payload(i),cfg) for i in range(source.total)]
             frames += [make_frame(source.meta(148,source.total,True),b'',cfg)]
@@ -50,6 +50,45 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(bytes(result.data),source.raw)
                 self.assertEqual(result.stats()['bit_errors'],0)
                 self.assertTrue(result.ended)
+
+    def test_bpsk_has_no_adjustable_phase_or_inactive_modulation_parameters(self):
+        cfg=Config(payload_bytes=192)
+        other=replace(cfg,phase_deg=87,ook_low=.7,fsk_deviation_hz=100_000)
+        source=Source.text('Fixed BPSK',payload_bytes=cfg.payload_bytes)
+        a=make_frame(source.meta(94,0),source.raw,cfg)
+        b=make_frame(source.meta(94,0),source.raw,other)
+        self.assertEqual(cfg.profile_tag(),other.profile_tag())
+        np.testing.assert_array_equal(a,b)
+        decoded=decode_frame(a[len(preamble_wave(cfg)):],other,0)
+        self.assertTrue(decoded.crc_ok)
+        self.assertEqual(decoded.payload,source.raw)
+
+    def test_fsk_deviation_hz_controls_tones_and_decodes_nonorthogonal_signals(self):
+        from modulations import fsk
+        for rate in (1_000_000,2_000_000):
+            for deviation in (50_000.,100_000.,187_500.):
+                cfg=Config('2-FSK',sample_rate=rate,payload_bytes=192,
+                           fsk_deviation_hz=deviation,pilot_symbols=64)
+                cfg.validate()
+                known=fsk.wave([-1,1],SPS,cfg.fsk_cycles).reshape(2,SPS)
+                actual=np.angle(known[:,1]/known[:,0])*rate/(2*np.pi)
+                np.testing.assert_allclose(actual,[-deviation,deviation],atol=1e-6)
+                source=Source.text('FSK frequency in Hz '*10,payload_bytes=192)
+                wave=make_frame(source.meta(95,0),source.payload(0),cfg)
+                wave *= .8*np.exp(1j*(.4+2*np.pi*13_711*np.arange(len(wave))/rate))
+                packets=StreamDecoder(cfg).feed(np.r_[wave,np.zeros(100)])
+                with self.subTest(rate=rate,deviation=deviation):
+                    self.assertEqual(len(packets),1)
+                    packet=packets[0]
+                    self.assertTrue(packet.crc_ok)
+                    self.assertEqual(packet.payload,source.payload(0))
+                    self.assertLess(packet.crc_error_energy/packet.crc_signal_energy,1e-8)
+                    rec=Reception(packet.meta,source,cfg.mod,{'cfg':asdict(cfg)})
+                    rec.accept(packet)
+                    self.assertEqual(rec.stats()['bit_errors'],0)
+                    self.assertLess(rec.error_sum/rec.signal_sum,1e-8)
+                other=replace(cfg,fsk_deviation_hz=deviation+1000)
+                self.assertNotEqual(cfg.profile_tag(),other.profile_tag())
 
     def test_image_packet_size_and_exact_lost_edge_pixels(self):
         for size in (65,192,768,1536):
@@ -123,7 +162,10 @@ class ProfileTests(unittest.TestCase):
     def test_invalid_profiles_are_rejected(self):
         for change in ({'pilot_symbols':0},{'preamble_symbols':20},{'data_symbols':0},
                        {'payload_bytes':65536},{'cp_symbols':200,'data_symbols':32},
-                       {'phase_deg':float('nan')},{'ook_low':1},{'fsk_cycles':4}):
+                       {'mod':'QPSK','phase_deg':float('nan')},{'mod':'ASK / OOK','ook_low':1},
+                       {'mod':'2-FSK','fsk_deviation_hz':0},
+                       {'mod':'2-FSK','fsk_deviation_hz':250_000},
+                       {'mod':'2-FSK','fsk_deviation_hz':float('nan')}):
             with self.subTest(change=change),self.assertRaises(ValueError):
                 Config(**change).validate()
 
@@ -132,7 +174,7 @@ class ProfileTests(unittest.TestCase):
             for mod in MODS:
                 profile=Config(mod,True,True,rate,0,preamble_symbols=80,cp_symbols=8,
                                pilot_symbols=16,data_symbols=64,payload_bytes=192,
-                               phase_deg=13,ook_low=.2,fsk_cycles=1.5)
+                               phase_deg=13,ook_low=.2,fsk_deviation_hz=rate*1.5/SPS)
                 cfg=EmitterConfig(sample_rate=rate*2,modulation=mod,packet_kind='image',packet_config=profile)
                 cfg.validate()
                 source=packet_source(cfg)

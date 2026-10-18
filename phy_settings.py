@@ -11,9 +11,10 @@ class PhySettings(ttk.LabelFrame):
         self.controls = controls
         defaults = Config()
         names = ('mod', 'preamble_symbols', 'preamble_seed', 'cp_symbols', 'pilot_symbols',
-                 'pilot_seed', 'data_symbols', 'payload_bytes', 'phase_deg', 'ook_low', 'fsk_cycles')
+                 'pilot_seed', 'data_symbols', 'payload_bytes', 'phase_deg', 'ook_low')
         for name in names:
             setattr(self, name, tk.StringVar(value=str(getattr(defaults, name))))
+        self.fsk_deviation_mhz = tk.StringVar(value=f'{defaults.fsk_deviation_hz/1_000_000:g}')
         self.preamble = tk.BooleanVar(value=True)
         self.cp = tk.BooleanVar(value=False)
         ttk.Label(self, text='Модуляция').grid(row=0, column=0, sticky='w', padx=4)
@@ -59,8 +60,11 @@ class PhySettings(ttk.LabelFrame):
         mod = self.mod.get()
         pts, k = constellation(mod)
         self.description.configure(text=f'{len(pts)} состояний · {k} бит/символ · Rs = Fs/{SPS}')
+        if mod == 'BPSK':
+            ttk.Label(self.mode_frame, text='BPSK: дополнительных настроек нет').grid(row=0, column=0, padx=4)
+            return
         if mod == '2-FSK':
-            label, variable = 'Отклонение каждого тона, × Rs (0.5 / 1 / 1.5)', self.fsk_cycles
+            label, variable = 'Девиация Δf, МГц (тоны f₀ ± Δf)', self.fsk_deviation_mhz
         elif mod == 'ASK / OOK':
             label, variable = 'Нижний / верхний уровень (0 = OOK; до 0.9)', self.ook_low
         else:
@@ -71,8 +75,12 @@ class PhySettings(ttk.LabelFrame):
         integer_names = ('preamble_symbols', 'preamble_seed', 'cp_symbols', 'pilot_symbols',
                          'pilot_seed', 'data_symbols', 'payload_bytes')
         values = {name: int(getattr(self, name).get()) for name in integer_names}
-        values.update({name: float(getattr(self, name).get().replace(',', '.'))
-                       for name in ('phase_deg', 'ook_low', 'fsk_cycles')})
+        mod = self.mod.get()
+        parameter = {'2-FSK': 'fsk_deviation_hz', 'ASK / OOK': 'ook_low'}.get(mod, 'phase_deg')
+        if mod == '2-FSK':
+            values[parameter] = float(self.fsk_deviation_mhz.get().replace(',', '.')) * 1_000_000
+        elif mod != 'BPSK':
+            values[parameter] = float(getattr(self, parameter).get().replace(',', '.'))
         cfg = Config(mod=self.mod.get(), preamble=self.preamble.get(), cp=self.cp.get(),
                      sample_rate=sample_rate, cfo_range=cfo_range, **values)
         cfg.validate()

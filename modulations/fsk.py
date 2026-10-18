@@ -1,4 +1,4 @@
-"""Orthogonal binary FSK with configurable half-integer tone cycles per symbol."""
+"""Binary FSK tones and matched-filter observations for any positive deviation."""
 import numpy as np
 
 
@@ -13,3 +13,8 @@ def wave(symbols, sps, cycles=1):
 def observe(rows, cycles=1):
     reference = tone(rows.shape[1], cycles)
     return np.column_stack((rows@reference, rows@reference.conj())) / rows.shape[1]
+
+
+def reference(symbols, sps, cycles=1):
+    """Ideal correlator outputs, including overlap of nonorthogonal tones."""
+    return observe(wave(symbols, sps, cycles).reshape(-1, sps), cycles)

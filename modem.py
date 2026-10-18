@@ -118,7 +118,11 @@ class Config:
     payload_bytes: int = 768
     phase_deg: float = 0.
     ook_low: float = 0.
-    fsk_cycles: float = 1.
+    fsk_deviation_hz: float = 125_000.
+
+    @property
+    def fsk_cycles(self):
+        return self.fsk_deviation_hz * SPS / self.sample_rate
 
     def profile_tag(self):
         # Receiver search range and settings of disabled sections are local.
@@ -134,7 +138,8 @@ class Config:
         elif self.mod == '2-FSK':
             values['fsk_cycles'] = float(self.fsk_cycles)
         else:
-            values['phase_deg'] = float(self.phase_deg)
+            # Preserve the default BPSK wire profile; its phase is fixed.
+            values['phase_deg'] = 0. if self.mod == 'BPSK' else float(self.phase_deg)
         return zlib.crc32(json.dumps(values, sort_keys=True).encode())
 
     def validate(self):
@@ -151,14 +156,16 @@ class Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f'{name}: целое число {low}…{high}')
-        # Half-integer tone cycles remain orthogonal and fit the Fs/4 RF offset.
-        if not math.isfinite(self.fsk_cycles) or self.fsk_cycles not in (0.5,1.,1.5):
-            raise ValueError('Отклонение FSK: 0.5, 1 или 1.5 × Rs')
+        # Both tones must fit after the receiver's Fs/4 digital frequency shift.
+        if self.mod == '2-FSK' and (not math.isfinite(self.fsk_deviation_hz) or
+                not 0 < self.fsk_deviation_hz < self.sample_rate/4):
+            raise ValueError(f'Девиация FSK: больше 0 и меньше {self.sample_rate/4_000_000:g} МГц')
         if self.cp_symbols > self.pilot_symbols+self.data_symbols:
             raise ValueError('CP не должен быть длиннее блока пилотов и данных')
-        if not math.isfinite(self.phase_deg) or not -180 <= self.phase_deg <= 180:
+        if self.mod not in ('BPSK', '2-FSK', 'ASK / OOK') and (
+                not math.isfinite(self.phase_deg) or not -180 <= self.phase_deg <= 180):
             raise ValueError('Поворот созвездия: −180…180°')
-        if not math.isfinite(self.ook_low) or not 0 <= self.ook_low <= 0.9:
+        if self.mod == 'ASK / OOK' and (not math.isfinite(self.ook_low) or not 0 <= self.ook_low <= 0.9):
             raise ValueError('Нижний уровень ASK: 0…0.9 от верхнего')
 
 
@@ -287,8 +294,7 @@ def decode_blocks(wave, count, cfg, fsk=False, equalize=False, quality=None):
             rows = pilot_rx.reshape(cfg.pilot_symbols, SPS)
             if fsk:
                 observed = fsk_mod.observe(rows, cfg.fsk_cycles)
-                reference = np.column_stack((pilot_symbols(cfg).real < 0,
-                                             pilot_symbols(cfg).real > 0)).astype(complex)
+                reference = fsk_mod.reference(pilot_symbols(cfg), SPS, cfg.fsk_cycles)
             else:
                 observed = rows[:,2:-2].mean(axis=1)
                 reference = pilot_symbols(cfg)
@@ -383,7 +389,7 @@ def decode_frame(wave, cfg, cfo, score=1.):
                          struct.pack('!I',zlib.crc32(payload)),payload_seed(meta))
         expected = symbols(encoded,cfg.mod,cfg)[:measured]
         if cfg.mod == '2-FSK':
-            expected = np.column_stack((expected < 0, expected > 0)).astype(complex)
+            expected = fsk_mod.reference(expected, SPS, cfg.fsk_cycles)
         crc_signal,crc_error = vector_energies(obs[:measured],expected)
     return Decoded(meta, payload, valid, obs, cfo, score,
                    sir_signal, sir_interference, measured,

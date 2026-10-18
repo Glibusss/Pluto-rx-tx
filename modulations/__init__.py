@@ -35,7 +35,8 @@ def _constellation(mod, phase, low):
 
 
 def constellation(mod, cfg=None):
-    return _constellation(mod, getattr(cfg, 'phase_deg', 0.), getattr(cfg, 'ook_low', 0.))
+    phase = 0. if mod == 'BPSK' else getattr(cfg, 'phase_deg', 0.)
+    return _constellation(mod, phase, getattr(cfg, 'ook_low', 0.))
 
 
 def bit_symbols(values, mod, cfg=None):
@@ -68,7 +69,8 @@ def decision_error_energies(observations, mod, cfg=None):
         return 0., 0.
     if mod == '2-FSK':
         choose_one = abs(z[:, 1]) > abs(z[:, 0])
-        decided = np.column_stack((~choose_one, choose_one)).astype(complex)
+        decided = _fsk.reference(np.where(choose_one, 1., -1.), SPS,
+                                 getattr(cfg, 'fsk_cycles', 1.))
     else:
         pts, _ = constellation(mod, cfg)
         decided = pts[np.argmin(abs(z[:, None]-pts[None, :])**2, axis=1)]

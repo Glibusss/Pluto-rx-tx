@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 from quality import ratio_db, evm_percent
+from modulations import SPS, fsk
 from modem import (PAYLOAD, MAX_BYTES, Meta, Decoded, bits, symbols, whiten, constellation,
                    payload_seed, MODS, Config, tile_shape)
 
@@ -151,7 +152,7 @@ class Reception:
             k = constellation(self.mod,self.cfg)[1]
             n = nbits//k  # only full payload symbols; excludes padding and CRC
             if self.mod == '2-FSK':
-                target = np.column_stack((expected[:n]<0, expected[:n]>0)).astype(complex)
+                target = fsk.reference(expected[:n], SPS, self.cfg.fsk_cycles)
                 observed = packet.observations[:n]
             else:
                 target, observed = expected[:n], packet.observations[:n]
