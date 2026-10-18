@@ -2,6 +2,7 @@ import threading
 import csv
 import json
 import errno
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -336,6 +337,150 @@ class RadioTests(unittest.TestCase):
             self.assertTrue(report['transfers'][-1]['end_seen'])
             self.assertIsNone(report['error'])
         self.assertTrue(sdr.destroyed)
+
+    def test_rx_preserves_primary_image_and_text_under_real_iq_interference(self):
+        from PIL import Image
+        from modem import sync_wave,header_blocks,block_len,SPS
+        from hackrf_emitter import EmitterConfig,packet_source
+        cfg=Config(preamble=False,cfo_range=0,payload_bytes=192,pilot_symbols=16,data_symbols=64)
+        red=packet_source(EmitterConfig(packet_kind='image',packet_config=cfg))
+        foreign=Source.text('Foreign text',payload_bytes=192)
+        red_frame=make_frame(red.meta(302,0),red.payload(0),cfg)
+        for kind in ('image','text'):
+            source=(Source(1,np.arange(16*8*3,dtype=np.uint8).tobytes(),16,8,payload_bytes=192)
+                    if kind=='image' else Source.text(('Main data '*39)[:384],payload_bytes=192))
+            first=make_frame(source.meta(301,0),source.payload(0),cfg)
+            start=len(sync_wave(cfg))+header_blocks(cfg)*block_len(cfg)+(cfg.pilot_symbols+8)*SPS
+            count=min(len(red_frame),len(first)-start)
+            first[start:start+count]+=1.7*red_frame[:count]  # Superposed RF interferer at baseband.
+            observations=[]
+            class ObservedDecoder(StreamDecoder):
+                def feed(self,*args,**kwargs):
+                    packets=super().feed(*args,**kwargs)
+                    observations.extend(packets)
+                    return packets
+            frames=[first,red_frame,make_frame(foreign.meta(303,0),foreign.payload(0),cfg),red_frame,
+                    make_frame(source.meta(301,1),source.payload(1),cfg),
+                    make_frame(source.meta(301,2,True),b'',cfg),
+                    make_frame(foreign.meta(303,1,True),b'',cfg)]
+            wave=np.concatenate(frames)
+            raw=32*wave*np.exp(2j*np.pi*.25*np.arange(len(wave)))
+            stop=threading.Event();events=[]
+            sdr=ScriptedRX([raw[i:i+32768] for i in range(0,len(raw),32768)],stop)
+            def emit(event,value):
+                events.append((event,value))
+                if event=='log' and value.startswith('Получен END.') and '000000000000012f' in value:
+                    stop.set()  # Explicit Stop after a foreign END following the primary END.
+            timeout=threading.Timer(5,stop.set)
+            with (self.subTest(kind=kind),tempfile.TemporaryDirectory() as folder,
+                  patch.object(radio,'connect',return_value=sdr),
+                  patch.object(radio,'RX_SNAPSHOT_INTERVAL',0),
+                  patch.object(radio,'StreamDecoder',ObservedDecoder)):
+                timeout.start()
+                try:
+                    radio.receive(dict(cfg=cfg),source,folder,stop,emit)
+                finally:
+                    timeout.cancel()
+                result=Path(folder)
+                decoded=next(p for p in observations if p.meta.transfer==301 and p.meta.seq==0)
+                self.assertFalse(decoded.crc_ok)
+                errors=int(np.unpackbits(np.frombuffer(decoded.payload,np.uint8)^
+                                         np.frombuffer(source.payload(0),np.uint8)).sum())
+                self.assertGreater(errors,0)
+                snapshots=[value for event,value in events if event=='snapshot']
+                self.assertTrue(snapshots)
+                self.assertEqual({value['stats']['transfer'] for value in snapshots},{'000000000000012d'})
+                self.assertEqual(snapshots[-1]['stats']['corrupted_bits'],errors)
+                self.assertEqual(snapshots[-1]['stats']['crc_packets'],1)
+                self.assertEqual(snapshots[-1]['stats']['good_packets'],1)
+                self.assertEqual(snapshots[-1]['stats']['lost_packets'],0)
+                if kind=='image':
+                    expected=source.rgb.copy()
+                    expected[:8,:8]=np.frombuffer(decoded.payload,np.uint8).reshape(8,8,3)
+                    actual=np.asarray(Image.open(result/'transfer_000000000000012d'/'received.png'))
+                    np.testing.assert_array_equal(actual,expected)
+                    self.assertGreater(snapshots[-1]['stats']['corrupted_pixels'],0)
+                else:
+                    expected=decoded.payload+source.payload(1)
+                    self.assertEqual((result/'transfer_000000000000012d'/'received.bin').read_bytes(),expected)
+                    self.assertEqual((result/'transfer_000000000000012d'/'received.txt').read_bytes(),
+                                     expected.decode('utf8',errors='replace').replace('\n',os.linesep).encode('utf8'))
+                self.assertEqual(snapshots[-1]['data'],expected.tobytes() if kind=='image' else expected)
+                red_image=np.asarray(Image.open(result/'transfer_000000000000012e'/'received.png'))
+                self.assertTrue(np.all(red_image==[255,0,0]))
+                self.assertEqual((result/'transfer_000000000000012f'/'received.bin').read_bytes(),foreign.raw)
+                report=json.loads(next((result/'rx_runs').glob('*.json')).read_text(encoding='utf8'))
+                self.assertEqual(report['primary_transfer'],'000000000000012d')
+                self.assertEqual(report['per'],.5)
+                self.assertEqual(report['ber'],errors/(source.meta(301,0).size*8))
+                self.assertEqual(len(report['transfers']),3)
+                self.assertIsNone(report['error'])
+            self.assertTrue(sdr.destroyed)
+
+    def test_foreign_reception_cache_saves_evictions_without_resetting_primary_text(self):
+        cfg=Config(payload_bytes=192)
+        source=Source.text('A'*384,payload_bytes=192)
+        foreign=Source.text('side',payload_bytes=192)
+        def packet(src,tid,seq,end=False):
+            frame=make_frame(src.meta(tid,seq,end),b'' if end else src.payload(seq),cfg)
+            from modem import preamble_wave
+            return decode_frame(frame[len(preamble_wave(cfg)):],cfg,0)
+        packets=[packet(source,401,0)]
+        packets += [packet(foreign,tid,0) for tid in range(402,410)]
+        packets += [packet(source,401,1),packet(source,401,2,True)]
+        for count,budget in ((2,64*1024*1024),(8,len(source.raw)+len(foreign.raw)+1)):
+            decoder=packet_batches(*[[p] for p in packets])
+            events=[]
+            with (self.subTest(count=count,budget=budget),tempfile.TemporaryDirectory() as folder,
+                  patch.object(radio,'connect',return_value=FakeRX()),
+                  patch.object(radio,'StreamDecoder',return_value=decoder),
+                  patch.object(radio,'RX_RECEPTION_CACHE_COUNT',count),
+                  patch.object(radio,'RX_RECEPTION_CACHE_BYTES',budget),
+                  patch.object(radio,'RX_SNAPSHOT_INTERVAL',0)):
+                radio.receive(dict(cfg=cfg),source if count==2 else None,folder,threading.Event(),
+                              lambda *event:events.append(event))
+                result=Path(folder)
+                self.assertEqual((result/'transfer_0000000000000191'/'received.bin').read_bytes(),source.raw)
+                for tid in range(402,410):
+                    self.assertEqual((result/f'transfer_{tid:016x}'/'received.bin').read_bytes(),foreign.raw)
+                snapshots=[value for event,value in events if event=='snapshot']
+                self.assertEqual({value['stats']['transfer'] for value in snapshots},{'0000000000000191'})
+                self.assertEqual(snapshots[-1]['stats']['good_packets'],2)
+                self.assertEqual(snapshots[-1]['stats']['lost_packets'],0)
+                report=json.loads(next((result/'rx_runs').glob('*.json')).read_text(encoding='utf8'))
+                self.assertEqual(report['primary_transfer'],'0000000000000191')
+                self.assertEqual(report['per'],0)
+                self.assertEqual(len(report['transfers']),9)
+                self.assertTrue(any(event=='log' and 'Лимит буферов' in value for event,value in events))
+
+    def test_reference_keeps_single_packet_image_and_text_selected(self):
+        from modem import preamble_wave
+        cfg=Config(payload_bytes=192)
+        for kind in ('image','text'):
+            source=(Source(1,bytes([70,90,110])*64,8,8,payload_bytes=192)
+                    if kind=='image' else Source.text('Primary text',payload_bytes=192))
+            foreign=Source.text('Other source',payload_bytes=192)
+            def packet(src,tid,end=False):
+                seq=src.total if end else 0
+                frame=make_frame(src.meta(tid,seq,end),b'' if end else src.payload(0),cfg)
+                return decode_frame(frame[len(preamble_wave(cfg)):],cfg,0)
+            packets=[packet(source,501),packet(foreign,502),packet(foreign,502,True),
+                     packet(source,501,True),packet(foreign,504),packet(source,503),
+                     packet(foreign,502),packet(source,503,True)]
+            decoder=packet_batches(*[[p] for p in packets]);events=[]
+            with (self.subTest(kind=kind),tempfile.TemporaryDirectory() as folder,
+                  patch.object(radio,'connect',return_value=FakeRX()),
+                  patch.object(radio,'StreamDecoder',return_value=decoder),
+                  patch.object(radio,'RX_SNAPSHOT_INTERVAL',0)):
+                radio.receive(dict(cfg=cfg),source,folder,threading.Event(),lambda *event:events.append(event))
+                snapshots=[value for event,value in events if event=='snapshot']
+                self.assertEqual({v['stats']['transfer'] for v in snapshots},
+                                 {'00000000000001f5','00000000000001f7'})
+                self.assertTrue(all(v['data']==source.raw for v in snapshots))
+                self.assertTrue(all(v['stats']['reference_match'] for v in snapshots))
+                self.assertEqual(snapshots[-1]['stats']['transfer'],'00000000000001f7')
+                self.assertEqual(snapshots[-1]['stats']['good_packets'],1)
+                self.assertEqual(snapshots[-1]['stats']['duplicates'],0)
 
     def test_rx_lost_packet_zero_continues_same_transfer_from_one(self):
         cfg=Config()

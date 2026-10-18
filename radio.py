@@ -1,5 +1,5 @@
 from __future__ import annotations
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -35,7 +35,9 @@ NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
 RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
-PROCESSING_REVISION = 'continuous-rx-profile-v4'
+RX_RECEPTION_CACHE_COUNT = 8
+RX_RECEPTION_CACHE_BYTES = 64 * 1024 * 1024
+PROCESSING_REVISION = 'interleaved-rx-profile-v5'
 
 
 def read_rx_buffer(sdr):
@@ -453,10 +455,11 @@ def receive(settings, reference, folder, stop, emit):
     squelched=[0]
     input_dbfs=[None]
     session=None
+    sessions=OrderedDict()
     run_started=utc_now()
     run_clock=time.monotonic()
     run_settings=experiment_settings(settings)
-    results=[]
+    results={}
     failure=None
     clipped_samples=[0]
     captured_samples=[0]
@@ -469,11 +472,16 @@ def receive(settings, reference, folder, stop, emit):
     threshold_dbfs=settings.get('squelch_dbfs')
     threshold_power=(None if threshold_dbfs is None else
                      ADC_FULL_SCALE**2*10**(float(threshold_dbfs)/10))
-    def update_transport():
-        if session is not None:
-            session.transport_drops=dropped[0]
-            session.transport_read_errors=read_errors[0]
-            session.transport_buffer_restarts=buffer_restarts[0]
+    def update_transport(target=None):
+        target=session if target is None else target
+        if target is not None:
+            target.transport_drops=dropped[0]
+            target.transport_read_errors=read_errors[0]
+            target.transport_buffer_restarts=buffer_restarts[0]
+    def save_reception(target):
+        update_transport(target)
+        results[target.meta.transfer]=target.stats(True)
+        return target.save(folder,True)
     try:
         sdr=connect(settings,False)
         run_settings=experiment_settings(settings,sdr)
@@ -599,25 +607,48 @@ def receive(settings, reference, folder, stop, emit):
             for packet in packets:
                 # Every header carries the expected count. Losing packet zero
                 # must not exclude the rest of the same laboratory attempt.
-                if session is None or session.meta.transfer != packet.meta.transfer:
-                    if session is not None:
-                        update_transport()
-                        results.append(session.stats(True))
-                        emit('log','Предыдущий результат: '+session.save(folder,True))
-                    session=Reception(packet.meta,reference,settings['cfg'].mod,run_settings)
-                    last_snapshot=-float('inf')
+                tid=packet.meta.transfer
+                target=sessions.get(tid)
+                if target is None:
+                    # Keep the displayed transfer intact when a different transmitter
+                    # is decoded between its packets. Bound retained foreign data.
+                    while (len(sessions)>=RX_RECEPTION_CACHE_COUNT or
+                           sum(len(item.data) for item in sessions.values())+packet.meta.size>
+                           RX_RECEPTION_CACHE_BYTES):
+                        victim=next(key for key,item in sessions.items() if item is not session)
+                        old=sessions.pop(victim)
+                        emit('log','Лимит буферов передач; сохранён результат: '+save_reception(old))
+                        del old
+                    target=Reception(packet.meta,reference,settings['cfg'].mod,run_settings)
+                    sessions[tid]=target
+                    results.setdefault(tid,None)
+                    # A reference match can select the intended source even if a
+                    # foreign one-packet image/text was acquired first.
+                    if (session is None or
+                            (target.reference_ok and not session.reference_ok) or
+                            ((session.ended or (session.meta.total==1 and len(session.rows)==1)) and
+                             (not session.reference_ok or target.reference_ok))):
+                        if session is not None:
+                            emit('log','Предыдущий результат: '+save_reception(session))
+                        session=target
+                        last_snapshot=-float('inf')
                     if packet.meta.seq != 0:
                         emit('log',f'Первый принятый заголовок: №{packet.meta.seq}. '
                              'Пакет №0 не принят; учитываю его потерю и продолжаю эту передачу.')
-                    suffix='' if session.reference_ok else ' — BER и SNR недоступны'
-                    emit('log',f'Передача {packet.meta.transfer:016x}; пакетов: {packet.meta.total}; '+
-                         session.reference_status+suffix)
-                was_end=session.ended
-                session.accept(packet)
-                update_transport()
-                snapshot_dirty=True
-                if session.ended and not was_end:
-                    saved=session.save(folder,True)
+                    suffix='' if target.reference_ok else ' — BER и SNR недоступны'
+                    emit('log',f'Передача {tid:016x}; пакетов: {packet.meta.total}; '+
+                         target.reference_status+suffix)
+                    if target is not session:
+                        emit('log',f'Сторонняя передача {tid:016x}; сборка основной '
+                             f'{session.meta.transfer:016x} продолжается.')
+                sessions.move_to_end(tid)
+                was_end=target.ended
+                target.accept(packet)
+                update_transport(target)
+                if target is session:
+                    snapshot_dirty=True
+                if target.ended and not was_end:
+                    saved=save_reception(target)
                     emit('log','Получен END. Результат сохранён: '+saved+
                          '. RX продолжает приём до Stop.')
             now=time.monotonic()
@@ -642,17 +673,19 @@ def receive(settings, reference, folder, stop, emit):
             failure='Драйвер RX не завершился за 3 с. Закройте приложение перед повторным запуском.'
         if sdr is not None and (capture is None or not capture.is_alive()):
             sdr.rx_destroy_buffer()
+        for target in sessions.values():
+            emit('log','Результат: '+save_reception(target))
         if session:
-            update_transport()
             emit('snapshot',session.snapshot(True))
-            results.append(session.stats(True))
-            emit('log','Результат: '+session.save(folder,True))
+        primary=results.get(session.meta.transfer) if session is not None else None
         summary=run_path(folder,'rx','.json')
         report=dict(started_utc=run_started,finished_utc=utc_now(),
             elapsed_seconds=time.monotonic()-run_clock,receiver_settings=run_settings,
             status='failed' if failure else 'finished' if results else 'no_valid_header',
-            error=failure,transfers=results,per=results[-1]['per'] if results else None,
-            ber=results[-1]['ber'] if results else None,transport_dropped_buffers=dropped[0],
+            error=failure,transfers=list(results.values()),
+            primary_transfer=primary['transfer'] if primary else None,
+            per=primary['per'] if primary else None,
+            ber=primary['ber'] if primary else None,transport_dropped_buffers=dropped[0],
             transport_read_errors=read_errors[0],transport_buffer_restarts=buffer_restarts[0],
             read_error_events=read_error_events,
             squelched_buffers=squelched[0],captured_samples=captured_samples[0],
