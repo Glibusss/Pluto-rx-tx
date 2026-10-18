@@ -16,7 +16,7 @@ from session import Source
 class FakeTX:
     def __init__(self):
         self.calls=[]
-        self.tx_lo=2399750000
+        self.tx_lo=2400000000
         self.sample_rate=1000000
         self.destroyed=False
         self.tx_hardwaregain_chan0=-30
@@ -25,7 +25,7 @@ class FakeTX:
 
 class FakeRX:
     def __init__(self):
-        self.rx_lo=2399750000
+        self.rx_lo=2400000000
         self.destroyed=False
     def rx(self):return np.zeros(64,np.complex64)
     def rx_destroy_buffer(self):self.destroyed=True
@@ -106,6 +106,7 @@ class FakePluto:
         self.ignore_stream_write=ignore_stream_write
         self.tx_hardwaregain_chan0=-10
         self._ctx=SimpleNamespace(set_timeout=lambda value:None)
+        self._rxadc=SimpleNamespace(set_kernel_buffers_count=lambda value:None)
         stream=SimpleNamespace(attrs={'sampling_frequency':FakeStreamRate(self)})
         debug={name:FakeIIOAttribute(value) for name,value in
                (('bist_prbs',1),('bist_tone','1'),('loopback',2))}
@@ -128,8 +129,18 @@ class RadioTests(unittest.TestCase):
                     self.assertEqual(int(stream.attrs['sampling_frequency'].value),rate)
                     for name in ('bist_prbs','bist_tone','loopback'):
                         self.assertEqual(int(connected._ctrl.debug_attrs[name].value.split()[0]),0)
-                    self.assertEqual(connected.tx_lo,2400000000-rate//4)
+                    self.assertEqual(connected.tx_lo,2400000000)
                     self.assertEqual(connected.tx_hardwaregain_chan0,-30)
+
+    def test_rx_connect_uses_selected_center_without_frequency_shift(self):
+        for rate in (1000000,2000000):
+            with self.subTest(rate=rate):
+                sdr=FakePluto()
+                settings=dict(cfg=Config(sample_rate=rate),frequency=2400000000,
+                              gain=20,uri='test-pluto')
+                with patch.dict('sys.modules',{'adi':SimpleNamespace(Pluto=lambda **kwargs:sdr)}):
+                    connected=radio.connect(settings,tx=False)
+                self.assertEqual(connected.rx_lo,2400000000)
 
     def test_tx_connect_rejects_wrong_real_stream_rate_with_output_muted(self):
         sdr=FakePluto(ignore_stream_write=True)
@@ -141,7 +152,7 @@ class RadioTests(unittest.TestCase):
 
     def test_tx_journal_records_real_host_stream_rate(self):
         sdr=FakePluto()
-        sdr.tx_lo=2399750000
+        sdr.tx_lo=2400000000
         settings=dict(cfg=Config(),frequency=2400000000,gain=-10,uri='test-pluto')
         actual=radio.experiment_settings(settings,sdr,tx=True)['actual']
         self.assertEqual(actual['sample_rate'],1000000)
@@ -214,7 +225,7 @@ class RadioTests(unittest.TestCase):
         decoder=StreamDecoder(settings['cfg'])
         packets=[]
         for iq in sdr.calls:
-            iq=iq/radio.TX_AMPLITUDE_DEFAULT*np.exp(-2j*np.pi*.25*np.arange(len(iq)))
+            iq=iq/radio.TX_AMPLITUDE_DEFAULT
             packets+=decoder.feed(iq)
         self.assertEqual(len(packets),8)
         data_packets=[p for p in packets if not p.meta.end]
@@ -238,7 +249,7 @@ class RadioTests(unittest.TestCase):
                             self.assertLess(np.max(abs(iq)),radio.TX_DIGITAL_FULL_SCALE-1)
                             # Include the driver's integer conversion and discarded low 4 bits.
                             codes=np.floor(iq.real/16)+1j*np.floor(iq.imag/16)
-                            baseband=codes*16/radio.TX_AMPLITUDE_DEFAULT*np.exp(-2j*np.pi*.25*np.arange(len(iq)))
+                            baseband=codes*16/radio.TX_AMPLITUDE_DEFAULT
                             packets=StreamDecoder(cfg).feed(baseband)
                             self.assertEqual(len(packets),1)
                             self.assertTrue(packets[0].crc_ok)
@@ -305,7 +316,7 @@ class RadioTests(unittest.TestCase):
                   (last,203,0,False),(last,203,1,True),(last,203,1,True)]
         wave=np.concatenate([make_frame(src.meta(tid,seq,end),b'' if end else src.payload(seq),cfg)
                              for src,tid,seq,end in sequence])
-        raw=32*wave*np.exp(2j*np.pi*.25*np.arange(len(wave)))
+        raw=32*wave
         stop=threading.Event();events=[]
         sdr=ScriptedRX([raw],stop)
         def emit(kind,value):
@@ -364,7 +375,7 @@ class RadioTests(unittest.TestCase):
                     make_frame(source.meta(301,2,True),b'',cfg),
                     make_frame(foreign.meta(303,1,True),b'',cfg)]
             wave=np.concatenate(frames)
-            raw=32*wave*np.exp(2j*np.pi*.25*np.arange(len(wave)))
+            raw=32*wave
             stop=threading.Event();events=[]
             sdr=ScriptedRX([raw[i:i+32768] for i in range(0,len(raw),32768)],stop)
             def emit(event,value):
@@ -526,7 +537,7 @@ class RadioTests(unittest.TestCase):
     def test_rx_spectrum_is_emitted_before_squelch_without_valid_packets(self):
         stop=threading.Event()
         class QuietRX:
-            rx_lo=2399750000
+            rx_lo=2400000000
             destroyed=False
             def rx(self):
                 stop.set()
@@ -544,7 +555,7 @@ class RadioTests(unittest.TestCase):
         traces=[value for kind,value in events if kind=='spectrum']
         self.assertEqual(len(traces),1)
         self.assertEqual(traces[0]['signal_frequency'],2400000000)
-        self.assertEqual(traces[0]['frequency'][2048],sdr.rx_lo)
+        self.assertEqual(traces[0]['frequency'][2048],2400000000)
         self.assertTrue(sdr.destroyed)
         decoder.feed.assert_not_called()
 
@@ -592,7 +603,7 @@ class RadioTests(unittest.TestCase):
         frames=[make_frame(source.meta(81,seq,end),b'' if end else source.payload(seq),cfg)
                 for seq,end in ((0,False),(source.total,True))]
         raw=np.concatenate(frames)
-        raw=32*raw*np.exp(2j*np.pi*.25*np.arange(len(raw)))
+        raw=32*raw
         stop=threading.Event();events=[]
         sdr=ScriptedRX([OSError(0,'No error'),raw],stop)
         with (tempfile.TemporaryDirectory() as folder,
@@ -618,7 +629,6 @@ class RadioTests(unittest.TestCase):
         frame1=make_frame(source.meta(82,1),source.payload(1),cfg)
         end=make_frame(source.meta(82,source.total,True),b'',cfg)
         raw=32*np.r_[frame0,frame1,end]
-        raw=raw*np.exp(2j*np.pi*.25*np.arange(len(raw)))
         split=len(frame0)//2
         stop=threading.Event()
         sdr=ScriptedRX([raw[:split],OSError(errno.ETIMEDOUT,'timeout'),raw[split:]],stop)

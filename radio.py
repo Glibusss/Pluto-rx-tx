@@ -2,7 +2,6 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import datetime, timezone
-from functools import lru_cache
 import ctypes
 import errno
 import json
@@ -37,7 +36,7 @@ RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
 RX_RECEPTION_CACHE_COUNT = 8
 RX_RECEPTION_CACHE_BYTES = 64 * 1024 * 1024
-PROCESSING_REVISION = 'interleaved-rx-profile-v5'
+PROCESSING_REVISION = 'interleaved-rx-baseband-v6'
 
 
 def read_rx_buffer(sdr):
@@ -96,13 +95,6 @@ def clipping_fraction(iq):
         return 0.
     limit = ADC_FULL_SCALE - 8
     return float(np.mean((abs(samples.real)>=limit) | (abs(samples.imag)>=limit)))
-
-
-@lru_cache(maxsize=8)
-def rx_mixer(length, offset):
-    wave = np.array([1,-1j,-1,1j],np.complex64)[(np.arange(length)+offset)%4]
-    wave.setflags(write=False)
-    return wave
 
 
 def tx_stream_sample_rate(sdr):
@@ -339,18 +331,16 @@ def connect(settings, tx=False):
     sdr.sample_rate = cfg.sample_rate
     if int(sdr.sample_rate) != cfg.sample_rate:
         raise RuntimeError(f'Pluto установил другую sample rate: {sdr.sample_rate}')
-    # Digital IF avoids AD936x DC cancellation eating the OOK carrier.
-    lo = frequency-cfg.sample_rate//4
     if tx:
         sdr.tx_enabled_channels=[0]
         configure_tx_packet_path(sdr,cfg.sample_rate)
-        sdr.tx_lo=lo
+        sdr.tx_lo=frequency
         sdr.tx_rf_bandwidth=cfg.sample_rate
         sdr.tx_cyclic_buffer=False
         sdr.tx_hardwaregain_chan0=settings['gain']
     else:
         sdr.rx_enabled_channels=[0]
-        sdr.rx_lo=lo
+        sdr.rx_lo=frequency
         sdr.rx_rf_bandwidth=cfg.sample_rate
         sdr.gain_control_mode_chan0='manual'
         sdr.rx_hardwaregain_chan0=settings['gain']
@@ -402,7 +392,7 @@ def transmit(settings, source, stop, emit):
                 gap=np.zeros(int(cfg.sample_rate*0.012),np.complex64)
                 frame=np.r_[gap,frame,gap]
                 frame=np.pad(frame,(0,(-len(frame))%4))
-                iq=(frame*amplitude*np.exp(2j*np.pi*.25*np.arange(len(frame)))).astype(np.complex64)
+                iq=(frame*amplitude).astype(np.complex64)
                 size=len(iq)
                 sdr.tx(iq)
                 # Count submitted buffers even if Stop interrupts the subsequent wait.
@@ -490,7 +480,6 @@ def receive(settings, reference, folder, stop, emit):
             emit('log',f'Порог эфирного фона включён: {float(threshold_dbfs):.1f} dBFS.')
         def collect():
             last_spectrum=-float('inf')
-            offset=0
             gap=None
             tail=0
             pretrigger=deque(maxlen=2)
@@ -525,7 +514,6 @@ def receive(settings, reference, folder, stop, emit):
                         # The new buffer is not contiguous with any retained samples.
                         pretrigger.clear()
                         tail=0
-                        offset=0
                         gap='read_error'
                         if capture_stop.wait(RX_READ_RETRY_DELAY*buffer_restarts[0]):
                             break
@@ -533,15 +521,13 @@ def receive(settings, reference, folder, stop, emit):
                     raw=np.asarray(raw,np.complex64)
                     now=time.monotonic()
                     if len(raw)>=16 and now-last_spectrum>=RX_SNAPSHOT_INTERVAL:
-                        center=int(getattr(sdr,'rx_lo',settings.get('frequency',0)-settings['cfg'].sample_rate//4))
+                        center=int(getattr(sdr,'rx_lo',settings.get('frequency',0)))
                         frequency,power=calculate_spectrum(raw[:4096],settings['cfg'].sample_rate,center)
                         emit('spectrum',dict(frequency=frequency,power=power,
                                             signal_frequency=settings.get('frequency',center),
                                             sample_rate=settings['cfg'].sample_rate))
                         last_spectrum=now
-                    # fs/4 oscillator has exactly four states, no growing float phase.
-                    iq=raw*rx_mixer(len(raw),offset)
-                    offset=(offset+len(raw))%4
+                    iq=raw
                     clipping=clipping_fraction(raw)
                     clipped_samples[0]+=int(round(clipping*len(raw)))
                     captured_samples[0]+=len(raw)

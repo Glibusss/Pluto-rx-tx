@@ -156,7 +156,6 @@ class Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f'{name}: целое число {low}…{high}')
-        # Both tones must fit after the receiver's Fs/4 digital frequency shift.
         if self.mod == '2-FSK' and (not math.isfinite(self.fsk_deviation_hz) or
                 not 0 < self.fsk_deviation_hz < self.sample_rate/4):
             raise ValueError(f'Девиация FSK: больше 0 и меньше {self.sample_rate/4_000_000:g} МГц')
