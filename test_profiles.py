@@ -51,17 +51,20 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(result.stats()['bit_errors'],0)
                 self.assertTrue(result.ended)
 
-    def test_bpsk_has_no_adjustable_phase_or_inactive_modulation_parameters(self):
-        cfg=Config(payload_bytes=192)
-        other=replace(cfg,phase_deg=87,ook_low=.7,fsk_deviation_hz=100_000)
-        source=Source.text('Fixed BPSK',payload_bytes=cfg.payload_bytes)
-        a=make_frame(source.meta(94,0),source.raw,cfg)
-        b=make_frame(source.meta(94,0),source.raw,other)
-        self.assertEqual(cfg.profile_tag(),other.profile_tag())
-        np.testing.assert_array_equal(a,b)
-        decoded=decode_frame(a[len(preamble_wave(cfg)):],other,0)
-        self.assertTrue(decoded.crc_ok)
-        self.assertEqual(decoded.payload,source.raw)
+    def test_fixed_constellations_ignore_inactive_modulation_parameters(self):
+        for mod in ('BPSK','QAM-4','QAM-16','QAM-64'):
+            with self.subTest(mod=mod):
+                cfg=Config(mod,payload_bytes=192)
+                other=replace(cfg,phase_deg=87,ook_low=.7,fsk_deviation_hz=100_000)
+                source=Source.text('Fixed '+mod,payload_bytes=cfg.payload_bytes)
+                a=make_frame(source.meta(94,0),source.raw,cfg)
+                b=make_frame(source.meta(94,0),source.raw,other)
+                self.assertEqual(cfg.profile_tag(),other.profile_tag())
+                np.testing.assert_array_equal(a,b)
+                replace(other,phase_deg=float('nan')).validate()
+                decoded=decode_frame(a[len(preamble_wave(cfg)):],other,0)
+                self.assertTrue(decoded.crc_ok)
+                self.assertEqual(decoded.payload,source.raw)
 
     def test_fsk_deviation_hz_controls_tones_and_decodes_nonorthogonal_signals(self):
         from modulations import fsk

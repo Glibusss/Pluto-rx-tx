@@ -12,7 +12,7 @@ from scipy.signal import find_peaks
 from scipy.optimize import minimize_scalar
 from quality import pilot_energies, vector_energies
 
-from modulations import (MODS, SPS, bits, pack, constellation, symbols, bit_symbols,
+from modulations import (MODS, PHASE_MODS, SPS, bits, pack, constellation, symbols, bit_symbols,
                          decisions, decision_error_energies, to_wave, fsk as fsk_mod)
 
 DATA_SYMBOLS = 128
@@ -138,8 +138,8 @@ class Config:
         elif self.mod == '2-FSK':
             values['fsk_cycles'] = float(self.fsk_cycles)
         else:
-            # Preserve the default BPSK wire profile; its phase is fixed.
-            values['phase_deg'] = 0. if self.mod == 'BPSK' else float(self.phase_deg)
+            # Preserve default wire profiles for fixed BPSK/QAM constellations.
+            values['phase_deg'] = float(self.phase_deg) if self.mod in PHASE_MODS else 0.
         return zlib.crc32(json.dumps(values, sort_keys=True).encode())
 
     def validate(self):
@@ -162,7 +162,7 @@ class Config:
             raise ValueError(f'Девиация FSK: больше 0 и меньше {self.sample_rate/4_000_000:g} МГц')
         if self.cp_symbols > self.pilot_symbols+self.data_symbols:
             raise ValueError('CP не должен быть длиннее блока пилотов и данных')
-        if self.mod not in ('BPSK', '2-FSK', 'ASK / OOK') and (
+        if self.mod in PHASE_MODS and (
                 not math.isfinite(self.phase_deg) or not -180 <= self.phase_deg <= 180):
             raise ValueError('Поворот созвездия: −180…180°')
         if self.mod == 'ASK / OOK' and (not math.isfinite(self.ook_low) or not 0 <= self.ook_low <= 0.9):

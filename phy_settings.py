@@ -2,7 +2,7 @@
 import tkinter as tk
 from tkinter import ttk
 from modem import Config
-from modulations import MODS, SPS, constellation
+from modulations import MODS, PHASE_MODS, SPS, constellation
 
 
 class PhySettings(ttk.LabelFrame):
@@ -60,8 +60,8 @@ class PhySettings(ttk.LabelFrame):
         mod = self.mod.get()
         pts, k = constellation(mod)
         self.description.configure(text=f'{len(pts)} состояний · {k} бит/символ · Rs = Fs/{SPS}')
-        if mod == 'BPSK':
-            ttk.Label(self.mode_frame, text='BPSK: дополнительных настроек нет').grid(row=0, column=0, padx=4)
+        if mod not in PHASE_MODS and mod not in ('2-FSK', 'ASK / OOK'):
+            ttk.Label(self.mode_frame, text=f'{mod}: дополнительных настроек нет').grid(row=0, column=0, padx=4)
             return
         if mod == '2-FSK':
             label, variable = 'Девиация Δf, МГц (тоны f₀ ± Δf)', self.fsk_deviation_mhz
@@ -79,7 +79,7 @@ class PhySettings(ttk.LabelFrame):
         parameter = {'2-FSK': 'fsk_deviation_hz', 'ASK / OOK': 'ook_low'}.get(mod, 'phase_deg')
         if mod == '2-FSK':
             values[parameter] = float(self.fsk_deviation_mhz.get().replace(',', '.')) * 1_000_000
-        elif mod != 'BPSK':
+        elif mod in PHASE_MODS or mod == 'ASK / OOK':
             values[parameter] = float(getattr(self, parameter).get().replace(',', '.'))
         cfg = Config(mod=self.mod.get(), preamble=self.preamble.get(), cp=self.cp.get(),
                      sample_rate=sample_rate, cfo_range=cfo_range, **values)

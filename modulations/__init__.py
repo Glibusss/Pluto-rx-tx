@@ -6,6 +6,7 @@ from . import fsk as _fsk
 
 MODS = ('ASK / OOK', '2-FSK', 'BPSK', 'QPSK', '8-PSK', 'QAM-4', 'QAM-16', 'QAM-64')
 SPS = 8
+PHASE_MODS = ('QPSK', '8-PSK')
 
 
 def bits(data):
@@ -27,7 +28,7 @@ def _constellation(mod, phase, low):
         pts = psk.points(2**k) * np.exp(1j*np.deg2rad(phase))
     elif mod in ('QAM-4', 'QAM-16', 'QAM-64'):
         k = {'QAM-4': 2, 'QAM-16': 4, 'QAM-64': 6}[mod]
-        pts = qam.points(2**k) * np.exp(1j*np.deg2rad(phase))
+        pts = qam.points(2**k)
     else:
         raise ValueError(mod)
     pts.setflags(write=False)
@@ -35,7 +36,7 @@ def _constellation(mod, phase, low):
 
 
 def constellation(mod, cfg=None):
-    phase = 0. if mod == 'BPSK' else getattr(cfg, 'phase_deg', 0.)
+    phase = getattr(cfg, 'phase_deg', 0.) if mod in PHASE_MODS else 0.
     return _constellation(mod, phase, getattr(cfg, 'ook_low', 0.))
 
 
