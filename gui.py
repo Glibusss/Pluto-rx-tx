@@ -271,7 +271,7 @@ class App(tk.Tk):
         self.tabs.add(self.log,text='Лог')
         self.plot.bind('<Configure>',lambda e:self.draw_plots())
         self.packet_canvas.bind('<Configure>',lambda e:self.draw_plots())
-        self.write_log('Первым запустите RX. Затем TX. Весь профиль сигнала должен совпадать; настройки фиксируются до Stop.')
+        self.write_log('Первым запустите RX. Затем TX. Активные настройки сигнала должны совпадать; настройки фиксируются до Stop.')
 
     def load_image(self):
         path=filedialog.askopenfilename(filetypes=[('Изображения','*.png *.jpg *.jpeg'),('Все файлы','*.*')])

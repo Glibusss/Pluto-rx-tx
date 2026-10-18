@@ -121,10 +121,14 @@ class Config:
     fsk_cycles: float = 1.
 
     def profile_tag(self):
-        # Receiver search range is local; all transmitted parameters must match.
+        # Receiver search range and settings of disabled sections are local.
         values = {name: getattr(self, name) for name in (
-            'mod', 'preamble', 'cp', 'sample_rate', 'preamble_symbols', 'preamble_seed',
-            'cp_symbols', 'pilot_symbols', 'pilot_seed', 'data_symbols', 'payload_bytes')}
+            'mod', 'preamble', 'cp', 'sample_rate',
+            'pilot_symbols', 'pilot_seed', 'data_symbols', 'payload_bytes')}
+        if self.preamble:
+            values.update(preamble_symbols=self.preamble_symbols, preamble_seed=self.preamble_seed)
+        if self.cp:
+            values['cp_symbols'] = self.cp_symbols
         if self.mod == 'ASK / OOK':
             values['ook_low'] = float(self.ook_low)
         elif self.mod == '2-FSK':

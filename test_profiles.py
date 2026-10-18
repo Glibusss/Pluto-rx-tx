@@ -87,6 +87,39 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(reception.reference_ok)
         self.assertIn('размер',reception.reference_status)
 
+    def test_inactive_preamble_and_cp_do_not_change_frame_or_decoding(self):
+        from itertools import product
+        for mod,preamble,cp in product(MODS,(False,True),(False,True)):
+            cfg=Config(mod,preamble,cp,payload_bytes=192)
+            changes={}
+            if not preamble:
+                changes.update(preamble_symbols=512,preamble_seed=842)
+            if not cp:
+                changes['cp_symbols']=4
+            receiver_cfg=replace(cfg,**changes)
+            source=Source.text('inactive fields',payload_bytes=192)
+            frame=make_frame(source.meta(83,0),source.payload(0),cfg)
+            other=make_frame(source.meta(83,0),source.payload(0),receiver_cfg)
+            with self.subTest(mod=mod,preamble=preamble,cp=cp):
+                self.assertEqual(cfg.profile_tag(),receiver_cfg.profile_tag())
+                np.testing.assert_array_equal(frame,other)
+                decoded=decode_frame(frame[len(preamble_wave(cfg)):],receiver_cfg,0)
+                self.assertTrue(decoded.crc_ok)
+                self.assertEqual(decoded.payload,source.raw)
+
+    def test_active_service_parameters_and_switches_change_profile(self):
+        cfg=Config(cp=True)
+        changes=({'cp_symbols':4},{'preamble_symbols':512},{'preamble_seed':842},
+                 {'preamble':False},{'cp':False})
+        source=Source.text('active fields')
+        raw=source.meta(84,0).encode(cfg)
+        for changed in changes:
+            other=replace(cfg,**changed)
+            with self.subTest(changed=changed):
+                self.assertNotEqual(cfg.profile_tag(),other.profile_tag())
+                with self.assertRaises(ValueError):
+                    Meta.decode(raw,other)
+
     def test_invalid_profiles_are_rejected(self):
         for change in ({'pilot_symbols':0},{'preamble_symbols':20},{'data_symbols':0},
                        {'payload_bytes':65536},{'cp_symbols':200,'data_symbols':32},
