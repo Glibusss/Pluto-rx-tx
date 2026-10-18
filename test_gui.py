@@ -69,6 +69,39 @@ class GuiTests(unittest.TestCase):
         finally:
             app.destroy()
 
+    def test_small_hackrf_rgb_is_decoded_and_displayed_at_visible_size(self):
+        import numpy as np
+        from PIL import ImageTk
+        from dataclasses import asdict
+        from modem import make_frame,decode_frame,preamble_wave
+        from session import Reception
+        from hackrf_emitter import EmitterConfig,packet_source
+        app=App(False)
+        try:
+            app.withdraw()
+            for size in (768,1024,4096):
+                cfg=Config(payload_bytes=size)
+                source=packet_source(EmitterConfig(packet_kind='image',packet_config=cfg))
+                frame=make_frame(source.meta(91+size,0),source.payload(0),cfg)
+                packet=decode_frame(frame[len(preamble_wave(cfg)):],cfg,0)
+                self.assertTrue(packet.crc_ok)
+                result=Reception(packet.meta,None,cfg.mod,{'cfg':asdict(cfg)})
+                result.accept(packet)
+                app.update_snapshot(result.snapshot())
+                app.update_idletasks()
+                photo=app.photo_refs['right']
+                with self.subTest(payload=size):
+                    self.assertEqual(bytes(result.data),source.raw)
+                    self.assertEqual(photo.height(),450)
+                    self.assertGreaterEqual(photo.width(),150)
+                    self.assertLessEqual(photo.width(),1050)
+                    self.assertLess(abs(photo.width()/photo.height()-source.width/source.height),.005)
+                    visible=np.asarray(ImageTk.getimage(photo).convert('RGB'))
+                    self.assertTrue(np.all(visible==[255,0,0]))
+                    self.assertEqual(str(app.received_panel.grid_info()),'{}')
+        finally:
+            app.destroy()
+
     def test_custom_radio_icon_replaces_default_tk_feather(self):
         pixels=app_icon_pixels()
         self.assertEqual((len(pixels),len(pixels[0])),(32,32))

@@ -35,7 +35,7 @@ NOISE_OUTLIER_SIGMAS = 5.0
 RX_SNAPSHOT_INTERVAL = 0.1
 RX_READ_RETRY_LIMIT = 3
 RX_READ_RETRY_DELAY = 0.2
-PROCESSING_REVISION = 'selected-modulation-profile-v3'
+PROCESSING_REVISION = 'continuous-rx-profile-v4'
 
 
 def read_rx_buffer(sdr):
@@ -617,9 +617,9 @@ def receive(settings, reference, folder, stop, emit):
                 update_transport()
                 snapshot_dirty=True
                 if session.ended and not was_end:
-                    emit('log','Получен END. Передача принята; RX останавливается.')
-                    stop.set()
-                    break
+                    saved=session.save(folder,True)
+                    emit('log','Получен END. Результат сохранён: '+saved+
+                         '. RX продолжает приём до Stop.')
             now=time.monotonic()
             if session and snapshot_dirty and not stop.is_set() and now-last_snapshot>=RX_SNAPSHOT_INTERVAL:
                 emit('snapshot',session.snapshot())

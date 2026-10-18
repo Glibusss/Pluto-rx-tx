@@ -47,6 +47,28 @@ class ScriptedRX(FakeRX):
         super().rx_destroy_buffer()
         self.destroy_count+=1
 
+def packet_batches(*batches):
+    """Simulate finite decoded input, then a user's explicit Stop on the next read."""
+    pending=iter(batches)
+    decoder=unittest.mock.Mock(candidates=sum(len(b) for b in batches),header_failures=0)
+    def feed(iq,stop):
+        batch=next(pending,None)
+        if batch is None:
+            stop.set()
+            return []
+        return batch
+    decoder.feed.side_effect=feed
+    return decoder
+
+
+def stop_after_end(stop,events):
+    def emit(kind,value):
+        events.append((kind,value))
+        if kind=='log' and value.startswith('Получен END.'):
+            stop.set()
+    return emit
+
+
 class NoWait:
     def is_set(self):return False
     def wait(self,duration):return False
@@ -246,29 +268,74 @@ class RadioTests(unittest.TestCase):
                                    Source.text('test'),NoWait(),lambda *x:None)
                 connect.assert_not_called()
 
-    def test_rx_stops_on_end_and_saves_run_settings(self):
+    def test_rx_saves_end_and_waits_for_explicit_stop(self):
         cfg=Config()
         source=Source.text('Hello RX')
         tid=72
         data=decode_frame(make_frame(source.meta(tid+1,0),source.payload(0),cfg)[len(PREAMBLE):],cfg,0)
         end=decode_frame(make_frame(source.meta(tid+1,source.total,True),b'',cfg)[len(PREAMBLE):],cfg,0)
-        decoder=unittest.mock.Mock()
-        decoder.candidates=decoder.header_failures=0
-        decoder.feed.side_effect=[[data,end]]
+        decoder=packet_batches([data,end])
         stop=threading.Event();events=[];sdr=FakeRX()
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=sdr),
               patch.object(radio,'StreamDecoder',return_value=decoder),
               patch.object(radio.Reception,'save',return_value='mock result') as save):
             radio.receive(dict(cfg=cfg,frequency=2400000000,gain=20),None,folder,stop,lambda *x:events.append(x))
-            save.assert_called_once_with(folder,True)
+            self.assertEqual(save.call_count,2)  # END checkpoint, then explicit Stop.
+            save.assert_called_with(folder,True)
+            self.assertGreaterEqual(decoder.feed.call_count,2)
             report=json.loads(next((Path(folder)/'rx_runs').glob('*.json')).read_text(encoding='utf-8'))
             self.assertEqual(report['receiver_settings']['cfg']['sample_rate'],1000000)
             self.assertEqual(report['receiver_settings']['frequency'],2400000000)
             self.assertEqual(report['transfers'][0]['good_packets'],1)
         self.assertTrue(stop.is_set())
         self.assertTrue(sdr.destroyed)
-        self.assertTrue(any(kind=='log' and 'RX останавливается' in value for kind,value in events))
+        self.assertTrue(any(kind=='log' and 'RX продолжает приём' in value for kind,value in events))
+
+    def test_rx_continues_through_end_red_repeats_and_next_transfer(self):
+        from PIL import Image
+        from hackrf_emitter import EmitterConfig,packet_source
+        cfg=Config(cfo_range=0)
+        first=Source.text('Before red')
+        red=packet_source(EmitterConfig(packet_kind='image',packet_config=cfg))
+        last=Source.text('After red')
+        sequence=[(first,201,0,False),(first,201,1,True),(first,201,1,True),
+                  (red,202,0,False),(red,202,0,False),(red,202,0,False),
+                  (last,203,0,False),(last,203,1,True),(last,203,1,True)]
+        wave=np.concatenate([make_frame(src.meta(tid,seq,end),b'' if end else src.payload(seq),cfg)
+                             for src,tid,seq,end in sequence])
+        raw=32*wave*np.exp(2j*np.pi*.25*np.arange(len(wave)))
+        stop=threading.Event();events=[]
+        sdr=ScriptedRX([raw],stop)
+        def emit(kind,value):
+            events.append((kind,value))
+            if kind=='log' and value.startswith('Передача 00000000000000ca;'):
+                self.assertFalse(stop.is_set())
+            if kind=='log' and value.startswith('Получен END.') and '00000000000000cb' in value:
+                stop.set()  # User stops only after the later transfer is received.
+        timeout=threading.Timer(5,stop.set)
+        with tempfile.TemporaryDirectory() as folder,patch.object(radio,'connect',return_value=sdr):
+            timeout.start()
+            try:
+                radio.receive(dict(cfg=cfg),None,folder,stop,emit)
+            finally:
+                timeout.cancel()
+            result=Path(folder)
+            self.assertEqual((result/'transfer_00000000000000c9'/'received.bin').read_bytes(),first.raw)
+            rgb=np.asarray(Image.open(result/'transfer_00000000000000ca'/'received.png'))
+            self.assertTrue(np.all(rgb==[255,0,0]))
+            red_stats=json.loads((result/'transfer_00000000000000ca'/'metrics.json').read_text(encoding='utf8'))
+            self.assertEqual(red_stats['good_packets'],1)
+            self.assertEqual(red_stats['duplicates'],2)
+            self.assertFalse(red_stats['end_seen'])
+            self.assertEqual((result/'transfer_00000000000000cb'/'received.bin').read_bytes(),last.raw)
+            report=json.loads(next((result/'rx_runs').glob('*.json')).read_text(encoding='utf8'))
+            self.assertEqual(len(report['transfers']),3)
+            self.assertEqual([x['transfer'] for x in report['transfers']],
+                             ['00000000000000c9','00000000000000ca','00000000000000cb'])
+            self.assertTrue(report['transfers'][-1]['end_seen'])
+            self.assertIsNone(report['error'])
+        self.assertTrue(sdr.destroyed)
 
     def test_rx_lost_packet_zero_continues_same_transfer_from_one(self):
         cfg=Config()
@@ -276,8 +343,7 @@ class RadioTests(unittest.TestCase):
         packets=[decode_frame(make_frame(source.meta(73,seq,end),
                  b'' if end else source.payload(seq),cfg)[len(PREAMBLE):],cfg,0)
                  for seq,end in ((1,False),(source.total,True))]
-        decoder=unittest.mock.Mock(candidates=2,header_failures=0)
-        decoder.feed.return_value=packets
+        decoder=packet_batches(packets)
         sdr=FakeRX();stop=threading.Event();events=[]
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=sdr),
@@ -301,8 +367,7 @@ class RadioTests(unittest.TestCase):
     def test_rx_end_only_counts_known_packets_as_lost(self):
         cfg=Config();source=Source.text('lost')
         end=decode_frame(make_frame(source.meta(74,source.total,True),b'',cfg)[len(PREAMBLE):],cfg,0)
-        decoder=unittest.mock.Mock(candidates=1,header_failures=0)
-        decoder.feed.return_value=[end]
+        decoder=packet_batches([end])
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=FakeRX()),
               patch.object(radio,'StreamDecoder',return_value=decoder)):
@@ -387,7 +452,7 @@ class RadioTests(unittest.TestCase):
         sdr=ScriptedRX([OSError(0,'No error'),raw],stop)
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',0)):
-            radio.receive(dict(cfg=cfg),source,folder,stop,lambda *x:events.append(x))
+            radio.receive(dict(cfg=cfg),source,folder,stop,stop_after_end(stop,events))
             report=json.loads(next((Path(folder)/'rx_runs').glob('*.json')).read_text(encoding='utf-8'))
             self.assertEqual(report['status'],'finished')
             self.assertEqual(report['per'],0)
@@ -414,7 +479,7 @@ class RadioTests(unittest.TestCase):
         sdr=ScriptedRX([raw[:split],OSError(errno.ETIMEDOUT,'timeout'),raw[split:]],stop)
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=sdr),patch.object(radio,'RX_READ_RETRY_DELAY',0)):
-            radio.receive(dict(cfg=cfg),source,folder,stop,lambda *x:None)
+            radio.receive(dict(cfg=cfg),source,folder,stop,stop_after_end(stop,[]))
             stat=json.loads((Path(folder)/'transfer_0000000000000052'/'metrics.json').read_text(encoding='utf-8'))
             self.assertEqual(stat['first_received_sequence'],1)
             self.assertEqual(stat['good_packets'],1)
@@ -477,8 +542,7 @@ class RadioTests(unittest.TestCase):
         packets=[decode_frame(make_frame(source.meta(75,seq),source.payload(seq),cfg)[len(PREAMBLE):],cfg,0)
                  for seq in range(source.total)]
         end=decode_frame(make_frame(source.meta(75,source.total,True),b'',cfg)[len(PREAMBLE):],cfg,0)
-        decoder=unittest.mock.Mock(candidates=5,header_failures=0)
-        decoder.feed.side_effect=[[packets[0]],[packets[1]],[packets[2]],[packets[3],end]]
+        decoder=packet_batches([packets[0]],[packets[1]],[packets[2]],[packets[3],end])
         events=[]
         with (tempfile.TemporaryDirectory() as folder,
               patch.object(radio,'connect',return_value=FakeRX()),

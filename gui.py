@@ -324,7 +324,14 @@ class App(tk.Tk):
 
     def show_image(self,label,im,key):
         im=im.copy()
-        im.thumbnail((530,120) if key=='left' else (1050,450))
+        bounds=(530,120) if key=='left' else (1050,450)
+        scale=min(bounds[0]/im.width,bounds[1]/im.height)
+        if key!='left' and scale>1:
+            # Make small received RGB packets visible, preserving their pixel colors.
+            im=im.resize((max(1,int(im.width*scale)),max(1,int(im.height*scale))),
+                         Image.Resampling.NEAREST)
+        else:
+            im.thumbnail(bounds)
         self.photo_refs[key]=ImageTk.PhotoImage(im)
         label.configure(image=self.photo_refs[key],text='')
 
